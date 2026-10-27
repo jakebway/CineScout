@@ -4076,6 +4076,11 @@ jobs:
               private var accepted = false
               /// FebBox asks twice: Accept on the share page, then Accept again in the console's "Working Together" box.
               private var consoleAcceptClicked: [String] = []
+              /// "Save to" box: 0 = not seen, 1 = folder picked, 2 = saved.
+              private var saveState = 0
+              private var sinceSave = 0
+              private var reloads = 0
+              private var lastFileProbe = -100
               private var probes = 0
               private var removeClicked = false
               private var goneCount = 0
@@ -4371,24 +4376,44 @@ jobs:
                   if probes >= (accepted ? 9 : 6) { goToConsole() }
               }
 
+              /// Your screens, in order: Accept (share page) → Accept ("Working Together") → "Save to": pick Movies → Save
+              /// → Files › Movies → the movie's folder → the video file → FebBox's preview.
               private func probeConsole() async {
                   let out = await evaluate("""
-                  (function (acceptSrc, doAccept, accepted, confirmSrc, collabSrc, previewSrc, names, files, clicked, consoleAcc) {
+                  (function (acceptSrc, doAccept, confirmSrc, collabSrc, previewSrc, folder, saveSrc, filesSrc, names, files, clicked, consoleAcc, saveState, waitFile) {
                     const vids = CS.videoSources();
                     if (vids.length) return JSON.stringify({ videos: vids });
-                    // The second Accept: the console's "Working Together" box (it may look like the first one).
+                    // 1. The second Accept: the console's "Working Together" box.
                     if (doAccept && consoleAcc.length < 3) {
                       const a = CS.clickText(new RegExp(acceptSrc, 'i'), consoleAcc, 45);
                       if (a) return JSON.stringify({ clicked: a, kind: 'consoleAccept' });
                     }
+                    const folderRe = folder ? new RegExp('^\\\\s*' + CS.esc(folder) + '\\\\s*$', 'i') : null;
+                    const saveRe = new RegExp(saveSrc, 'i');
+                    // 2. "Save to": pick the folder (Movies), then Save.
+                    const dlg = CS.dialog(/^\\s*save to\\s*$/i, saveRe);
+                    if (dlg) {
+                      if (saveState < 1 && folderRe) {
+                        const f = CS.clickIn(dlg, folderRe, clicked, 40);
+                        if (f) return JSON.stringify({ clicked: f, kind: 'pickFolder' });
+                      }
+                      const sv = CS.clickIn(dlg, saveRe, clicked, 12);
+                      if (sv) return JSON.stringify({ clicked: sv, kind: 'save' });
+                      return JSON.stringify({ present: false, dialog: true });
+                    }
                     const c0 = CS.clickText(new RegExp(confirmSrc, 'i'), clicked, 20);
                     if (c0) return JSON.stringify({ clicked: c0, kind: 'confirm' });
-                    // Inside the movie's folder: tap the video file (best quality first).
+                    // Just tapped a file: give FebBox's preview a moment (tap its Play button if it shows one).
+                    if (waitFile) {
+                      const pv = CS.clickText(new RegExp(previewSrc, 'i'), clicked, 30);
+                      return JSON.stringify(pv ? { clicked: pv, kind: 'preview', present: true } : { present: true, waiting: true });
+                    }
+                    // 3. Inside the movie's folder: tap the video file (best quality first).
                     for (let i = 0; i < files.length; i++) {
                       const f = CS.findName([files[i]]);
                       if (f) { const s = CS.clickElement(f, clicked); if (s) return JSON.stringify({ clicked: s, kind: 'file', present: true }); }
                     }
-                    // The movie's folder in Shared.
+                    // 4. The movie's folder (in Movies, or in Shared).
                     const item = CS.findName(names);
                     if (item) {
                       const s = CS.clickElement(item, clicked);
@@ -4397,17 +4422,22 @@ jobs:
                     const p = CS.clickText(new RegExp(previewSrc, 'i'), clicked, 30);
                     if (p) return JSON.stringify({ clicked: p, kind: 'preview', present: !!item });
                     if (!item) {
+                      // 5. Get to Files › Movies.
+                      if (folderRe) { const m = CS.clickText(folderRe, clicked, 40); if (m) return JSON.stringify({ clicked: m, kind: 'folder', present: false }); }
+                      const fl = CS.clickText(new RegExp(filesSrc, 'i'), clicked, 20);
+                      if (fl) return JSON.stringify({ clicked: fl, kind: 'files', present: false });
                       const s = CS.clickText(new RegExp(collabSrc, 'i'), clicked, 40);
                       if (s) return JSON.stringify({ clicked: s, kind: 'section', present: false });
                     }
                     return JSON.stringify({ present: !!item });
-                  })(\(js(rules.febboxAcceptPattern)), \(rules.febboxAutoAccept ?? true), \(accepted), \(js(playConfirm)), \(js(rules.febboxCollabPattern)), \(js(rules.febboxPreviewPattern)), \(namesJSON), \(fileNamesJSON), \(clickedJSON), \(consoleAcceptJSON))
+                  })(\(js(rules.febboxAcceptPattern)), \(rules.febboxAutoAccept ?? true), \(js(playConfirm)), \(js(rules.febboxCollabPattern)), \(js(rules.febboxPreviewPattern)), \(saveFolderJSON), \(js(rules.febboxSavePattern)), \(js(rules.febboxFilesPattern)), \(namesJSON), \(fileNamesJSON), \(clickedJSON), \(consoleAcceptJSON), \(saveState), \(probes - lastFileProbe < 7))
                   """)
                   if let list = out["videos"] as? [String] {
                       for s in list { if let u = URL(string: s) { foundVideo(u) } }
                       return
                   }
-                  if out["kind"] as? String == "consoleAccept", let c = out["clicked"] as? String {
+                  let kind = out["kind"] as? String
+                  if kind == "consoleAccept", let c = out["clicked"] as? String {
                       consoleAcceptClicked.append(c)
                       accepted = true
                       DiagLog.shared.log("robot", "Tapped “\(label(c))” in the console's collaboration box.")
@@ -4416,26 +4446,50 @@ jobs:
                   }
                   if let c = out["clicked"] as? String {
                       clicked.append(c)
-                      switch out["kind"] as? String {
-                      case "accept":
-                          accepted = true
-                          DiagLog.shared.log("robot", "Tapped “\(label(c))” in the console.")
-                          say("Accepting the collaboration…")
+                      switch kind {
+                      case "pickFolder":
+                          saveState = 1
+                          DiagLog.shared.log("robot", "Picked “\(label(c))” in Save to.")
+                          say("Saving it to \(rules.febboxSaveFolder ?? "your folder")…")
+                      case "save":
+                          saveState = 2
+                          sinceSave = 0
+                          // The folder list changes after saving; let the Movies tile be tapped again.
+                          clicked.removeAll()
+                          DiagLog.shared.log("robot", "Tapped Save.")
+                          say("Saved. Opening \(rules.febboxSaveFolder ?? "the folder")…")
+                      case "folder":
+                          sinceSave = 0
+                          DiagLog.shared.log("robot", "Opened “\(label(c))”.")
+                          say("Opening \(label(c))…")
+                      case "files": say("Opening Files…")
                       case "section": say("Opening Shared…")
                       case "item":
+                          sinceSave = 0
                           // Remember exactly which folder we opened, so the same one is removed afterwards.
                           let opened = label(c)
                           if opened.count > 2 && !names.contains(opened) { names.insert(opened, at: 0) }
-                          DiagLog.shared.log("robot", "Opened “\(opened)” in Shared.")
+                          DiagLog.shared.log("robot", "Opened “\(opened)”.")
                           say("Opening “\(opened)”…")
                       case "file":
+                          lastFileProbe = probes
                           DiagLog.shared.log("robot", "Tapped the file “\(label(c))”.")
                           say("Starting “\(label(c))”…")
                       case "preview": say("Starting FebBox's preview…")
                       default: break
                       }
+                  } else if saveState == 2 {
+                      // Saved, but nothing to tap here: start again from the console's Files page (once or twice).
+                      sinceSave += 1
+                      if sinceSave == 4 && reloads < 2, let console = URL(string: rules.febboxConsoleURL ?? "") {
+                          reloads += 1
+                          sinceSave = 0
+                          clicked.removeAll()
+                          DiagLog.shared.log("robot", "Reloading the console to find \(rules.febboxSaveFolder ?? "the folder").")
+                          webView.load(URLRequest(url: console))
+                      }
                   }
-                  if probes == 8 && (out["present"] as? Bool) != true {
+                  if probes == 12 && (out["present"] as? Bool) != true {
                       DiagLog.shared.log("robot", "Couldn't find \(names.first ?? "the file") in the console yet (\(webView.url?.absoluteString ?? "-")).")
                       await saveSample()
                   }
@@ -4443,7 +4497,7 @@ jobs:
 
               private func probeRemove() async {
                   let out = await evaluate("""
-                  (function (collabSrc, removeSrc, confirmSrc, moreSrc, names, clicked, removeClicked) {
+                  (function (collabSrc, removeSrc, confirmSrc, moreSrc, names, clicked, removeClicked, folder, filesSrc) {
                     const removeRe = new RegExp(removeSrc, 'i'), moreRe = new RegExp(moreSrc, 'i');
                     if (removeClicked) {
                       const c = CS.clickText(new RegExp(confirmSrc, 'i'), clicked, 25);
@@ -4451,6 +4505,10 @@ jobs:
                     }
                     const row = CS.findName(names);
                     if (!row) {
+                      // The folder lives in Files › Movies (or Shared).
+                      if (folder) { const m = CS.clickText(new RegExp('^\\s*' + CS.esc(folder) + '\\s*$', 'i'), clicked, 40); if (m) return JSON.stringify({ clicked: m, kind: 'folder', present: false }); }
+                      const fl = CS.clickText(new RegExp(filesSrc, 'i'), clicked, 20);
+                      if (fl) return JSON.stringify({ clicked: fl, kind: 'files', present: false });
                       const s = CS.clickText(new RegExp(collabSrc, 'i'), clicked, 40);
                       return JSON.stringify(s ? { clicked: s, kind: 'section', present: false } : { present: false });
                     }
@@ -4483,7 +4541,7 @@ jobs:
                       return JSON.stringify({ clicked: 'context|' + CS.text(row), kind: 'more', present: true });
                     }
                     return JSON.stringify({ present: true });
-                  })(\(js(rules.febboxCollabPattern)), \(js(rules.febboxRemovePattern)), \(js(rules.febboxConfirmPattern)), \(js(rules.febboxMorePattern)), \(namesJSON), \(clickedJSON), \(removeClicked))
+                  })(\(js(rules.febboxCollabPattern)), \(js(rules.febboxRemovePattern)), \(js(rules.febboxConfirmPattern)), \(js(rules.febboxMorePattern)), \(namesJSON), \(clickedJSON), \(removeClicked), \(saveFolderJSON), \(js(rules.febboxFilesPattern)))
                   """)
                   if let c = out["clicked"] as? String {
                       clicked.append(c)
@@ -4561,6 +4619,31 @@ jobs:
                   });
                   return out;
                 },
+                esc: function (s) { return (s || '').replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&'); },
+                dialog: function (headRe, buttonRe) {
+                  var els = Array.from(document.querySelectorAll('h1, h2, h3, h4, h5, h6, header, strong, b, div, span, p, label')).reverse();
+                  for (var i = 0; i < els.length; i++) {
+                    var h = els[i]; if (h.children.length > 2 || !CS.visible(h)) continue;
+                    var t = CS.text(h); if (!t || t.length > 30 || !headRe.test(t)) continue;
+                    var a = h.parentElement;
+                    for (var k = 0; k < 8 && a; k++, a = a.parentElement) {
+                      var hasBtn = Array.from(a.querySelectorAll('button, a, [role=button], div, span')).some(function (b) { return CS.visible(b) && buttonRe.test(CS.text(b)); });
+                      if (hasBtn) return a;
+                    }
+                  }
+                  return null;
+                },
+                clickIn: function (root, re, clicked, maxLen) {
+                  var els = Array.from(root.querySelectorAll('a, button, [role=button], [role=option], li, div, span, p, label')).reverse();
+                  for (var i = 0; i < els.length; i++) {
+                    var el = els[i]; if (el.children.length > 5 || !CS.visible(el)) continue;
+                    var t = CS.text(el); if (!t || t.length > maxLen || !re.test(t)) continue;
+                    var s = 'in|' + CS.sig(el, t); if (clicked.indexOf(s) >= 0) continue;
+                    try { el.scrollIntoView({ block: 'center' }); } catch (e) {}
+                    el.click(); return s;
+                  }
+                  return null;
+                },
                 norm: function (s) { return (s || '').toLowerCase().replace(/\\.[a-z0-9]{2,4}$/, '').replace(/[^a-z0-9]+/g, ' ').trim().replace(/^(the|a|an) /, ''); },
                 findName: function (names) {
                   var wanted = names.map(CS.norm).filter(function (n) { return n.length > 2; });
@@ -4589,6 +4672,10 @@ jobs:
 
               private var consoleAcceptJSON: String {
                   String(decoding: (try? JSONEncoder().encode(consoleAcceptClicked)) ?? Data("[]".utf8), as: UTF8.self)
+              }
+
+              private var saveFolderJSON: String {
+                  String(decoding: (try? JSONEncoder().encode(rules.febboxSaveFolder ?? "")) ?? Data("\"\"".utf8), as: UTF8.self)
               }
 
               private var fileNamesJSON: String {
@@ -4868,9 +4955,14 @@ jobs:
               var febboxPreviewPattern: String?
               /// Refuse FebBox redirects away from the share link before a share page has shown (false = never refuse).
               var febboxBlockRedirects: Bool?
+              /// After the second Accept, FebBox asks where to save the folder: this one (e.g. "Movies").
+              var febboxSaveFolder: String?
+              var febboxSavePattern: String?
+              /// The console's link to your files, used to get back to the save folder.
+              var febboxFilesPattern: String?
 
               static let defaults = Rules(
-                  version: 12,
+                  version: 13,
                   note: "CineScout scanner rules. Claude can send you a new version of this file: paste it in Diagnostics → Scanner rules, save, then rescan. Optional `script` is JavaScript defining extract(html, url) that returns {title, year, overview, poster, videos: [], playLinks: [], links: [], isMovie}; call log(text) to write to the diagnostic log.",
                   playLabelPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:play|watch|stream|view online|start watching|resume|download|direct link|mirror|server)\b|\b(?:2160p|1080p|720p|480p|4k|full movie)\b|^\s*[▶►⏵]"#,
                   genericLabelPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:play|play now|watch|watch now|watch online|watch movie|watch free|stream|stream now|view|download|download now|direct link|link|here|click here|more|more info|info|details|trailer|open|start|resume|next|previous|prev|back|home|menu|login|log in|sign in|register|search|parent directory|\.\./?|name|last modified|size|description|(?:server|mirror|source|part|episode|ep|season|page)\s*#?\d*|\d{3,4}p|4k|uhd|hd|sd|mp4|mkv|m3u8|open in \S+(?: app)?|»|«|›|‹|\d{1,2})\s*$"#,
@@ -4914,10 +5006,13 @@ jobs:
                   febboxLoginURL: "https://www.febbox.com/login",
                   febboxCollabPattern: #"(?i)^\s*(?:shared|shared files|shared with me|my shared)\s*$"#,
                   febboxRemovePattern: #"(?i)^\s*(?:remove(?: from (?:list|collaboration))?|exit(?: collaboration)?|leave(?: collaboration)?|quit(?: collaboration)?|cancel collaboration|stop collaborat(?:ing|ion)|delete)\s*$"#,
-                  febboxMorePattern: #"(?i)^\s*(?:⋯|…|\.\.\.|more|more actions|menu|options)\s*$"#,
+                  febboxMorePattern: #"(?i)^\s*(?:⋯|…|\.\.\.|•••|···|more|more actions|menu|options)\s*$"#,
                   febboxStreamPreview: true,
                   febboxPreviewPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:preview|play|watch|open|stream|play online|online play)\s*$"#,
-                  febboxBlockRedirects: true
+                  febboxBlockRedirects: true,
+                  febboxSaveFolder: "Movies",
+                  febboxSavePattern: #"(?i)^\s*(?:save|save here|confirm|ok)\s*$"#,
+                  febboxFilesPattern: #"(?i)^\s*(?:files|my files|all files)\s*$"#
               )
 
               /// These rules with built-in defaults filled in for anything missing.
@@ -4960,7 +5055,10 @@ jobs:
                       febboxMorePattern: febboxMorePattern ?? d.febboxMorePattern,
                       febboxStreamPreview: febboxStreamPreview ?? d.febboxStreamPreview,
                       febboxPreviewPattern: febboxPreviewPattern ?? d.febboxPreviewPattern,
-                      febboxBlockRedirects: febboxBlockRedirects ?? d.febboxBlockRedirects
+                      febboxBlockRedirects: febboxBlockRedirects ?? d.febboxBlockRedirects,
+                      febboxSaveFolder: febboxSaveFolder ?? d.febboxSaveFolder,
+                      febboxSavePattern: febboxSavePattern ?? d.febboxSavePattern,
+                      febboxFilesPattern: febboxFilesPattern ?? d.febboxFilesPattern
                   )
               }
 
