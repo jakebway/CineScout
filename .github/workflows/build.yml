@@ -403,44 +403,22 @@ jobs:
                   .disabled(!canAct)
               }
 
-              private var finding: Bool { store.lookingUp.contains(movie.id) && !movie.hasVideo && movie.externalLinks.isEmpty }
+              private var finding: Bool { store.lookingUp.contains(movie.id) && !movie.hasVideo }
 
-              private var canAct: Bool { !finding && (movie.hasVideo || !movie.externalLinks.isEmpty || movie.needsLookup || movie.pageURL != nil) }
+              private var canAct: Bool {
+                  !finding && (movie.hasVideo || !movie.externalLinks.isEmpty || movie.needsLookup || movie.pageURL != nil)
+              }
 
               private var title: String {
-                  if movie.hasVideo { return store.resumePosition(movie.id) != nil ? "Resume" : "Play" }
-                  if movie.needsLookup { return store.resumePosition(movie.id) != nil ? "Resume" : "Play" }
-                  if let e = movie.externalLinks.first { return "Play from \(e.service)" }
-                  if movie.pageURL != nil { return "Open Website" }
-                  return "Not Available"
+                  guard canAct || finding else { return "Not Available" }
+                  return store.resumePosition(movie.id) != nil ? "Resume" : "Play"
               }
 
-              private var icon: String {
-                  if movie.hasVideo || movie.needsLookup { return "play.fill" }
-                  return movie.externalLinks.isEmpty ? "safari.fill" : "arrow.up.forward.app.fill"
-              }
+              private var icon: String { "play.fill" }
 
+              /// One tap does everything: finds the video (clicking through the site if needed) and plays it.
               private func tap() {
-                  if movie.hasVideo {
-                      store.play(movie)
-                  } else if movie.needsLookup {
-                      // Open the movie's play links now, then play whatever is behind them.
-                      Task {
-                          guard let found = await store.lookUpNow(movie) else { return }
-                          if found.hasVideo {
-                              store.play(found)
-                          } else if let e = found.externalLinks.first {
-                              store.open(e, for: found)
-                          } else if let p = found.pageURL {
-                              DiagLog.shared.log("video", "No playable video behind “\(found.title)”; opening its web page.")
-                              openURL(p)
-                          }
-                      }
-                  } else if let e = movie.externalLinks.first {
-                      store.open(e, for: movie)
-                  } else if let p = movie.pageURL {
-                      openURL(p)
-                  }
+                  Task { await store.playSmart(movie) }
               }
           }
 
@@ -1505,6 +1483,14 @@ jobs:
               @Published var webSession: WebSession?
               /// A plain-English message shown as an alert.
               @Published var alertMessage: String?
+              /// What the hidden browser is doing right now (shown over the app while you wait).
+              @Published private(set) var robotStatus: String?
+              /// A video on its way through download → compress → play → delete.
+              @Published var prepareJob: PrepareJob?
+              private var robot: BrowserRobot?
+              private var backgroundRobot: BrowserRobot?
+              private var robotQueue: [String] = []
+              private var robotTried: Set<String> = []
               /// Movies found by the most recent scan (used by first-time setup).
               @Published private(set) var lastScanFound = 0
 
@@ -1595,6 +1581,7 @@ jobs:
 
               /// A movie came on screen: look up its video in the background.
               func prefetch(_ m: Movie) {
+                  if !m.needsLookup { queueRobot(m) }
                   guard m.needsLookup, m.pageURL != nil, !lookingUp.contains(m.id), !lookupQueue.contains(m.id) else { return }
                   lookupQueue.append(m.id)
                   pumpLookups()
@@ -1603,6 +1590,7 @@ jobs:
               /// It scrolled away before its turn came: don't bother.
               func cancelPrefetch(_ m: Movie) {
                   lookupQueue.removeAll { $0 == m.id }
+                  robotQueue.removeAll { $0 == m.id }
               }
 
               /// Look up a movie's video right now (you opened it or pressed Play) and wait for it.
@@ -1620,7 +1608,7 @@ jobs:
               }
 
               private func pumpLookups() {
-                  while lookupRunning < 3, !lookupQueue.isEmpty {
+                  while lookupRunning < 4, !lookupQueue.isEmpty {
                       let id = lookupQueue.removeFirst()
                       guard let m = movie(id), m.needsLookup, let page = m.pageURL else {
                           finishLookup(id)
@@ -1632,6 +1620,7 @@ jobs:
                           let scraper = Scraper(root: page, maxPages: 40, sourceKey: m.source, rules: Rules.load())
                           let updated = await scraper.resolve(m)
                           self.applyLookup(updated)
+                          if let after = self.movie(id) { self.queueRobot(after) }
                           self.lookupRunning -= 1
                           self.lookingUp.remove(id)
                           self.finishLookup(id)
@@ -1714,6 +1703,89 @@ jobs:
               // MARK: Playback
 
               /// Plays the movie (resuming where you left off), or opens its FebBox / web link.
+              // MARK: One-tap Play
+
+              /// Everything behind the Play button, fully automatic:
+              /// a video we have → play; play links not opened yet → open them;
+              /// still nothing → the hidden browser clicks Watch now → Download → FebBox share page,
+              /// finds the video file, then download → compress → play → delete.
+              func playSmart(_ given: Movie) async {
+                  guard robot == nil else { return }
+                  var m = movie(given.id) ?? given
+                  if m.hasVideo { play(m); return }
+
+                  if m.needsLookup {
+                      robotStatus = "Looking for the video…"
+                      if let r = await lookUpNow(m) { m = r }
+                      if m.hasVideo { robotStatus = nil; play(m); return }
+                  }
+
+                  let svc = Rules.load().externalServices?.first
+                  let knownShare = m.externalLinks.first { l in svc.map { $0.accepts($0.canonical(l.url)) } ?? true }?.url
+                  guard knownShare != nil || m.pageURL != nil else {
+                      robotStatus = nil
+                      alertMessage = "CineScout doesn't have a page or link for this movie yet. Pull down on the Home screen to rescan."
+                      return
+                  }
+
+                  robotStatus = knownShare == nil ? "Opening the movie's page…" : "Opening the FebBox share page…"
+                  backgroundRobot?.cancel()
+                  let r = BrowserRobot(rules: Rules.load()) { [weak self] text in self?.robotStatus = text }
+                  robot = r
+                  let result = await r.run(page: m.pageURL, share: knownShare)
+                  robot = nil
+                  robotStatus = nil
+
+                  if let share = result.share { remember(share: share, for: m.id, service: svc?.name ?? "FebBox") }
+                  m = movie(m.id) ?? m
+
+                  if let video = result.videos.first {
+                      prepareJob = PrepareJob(movie: m, url: video, cookies: result.cookies, headers: result.headers)
+                  } else if let share = result.share {
+                      DiagLog.shared.log("robot", "No video file found automatically on \(share.absoluteString); showing the share page.")
+                      webSession = WebSession(movie: m, link: ExternalLink(service: svc?.name ?? "FebBox", url: share, label: nil))
+                  } else {
+                      alertMessage = "CineScout opened “\(m.title)” and clicked through, but didn't reach a FebBox share page. Send Claude a report from Settings so it can be fixed with a paste."
+                  }
+              }
+
+              func cancelRobot() {
+                  robot?.cancel()
+              }
+
+              private func remember(share: URL, for id: String, service: String) {
+                  guard let i = movies.firstIndex(where: { $0.id == id }),
+                        !movies[i].externalLinks.contains(where: { $0.url == share }) else { return }
+                  movies[i].externalLinks.insert(ExternalLink(service: service, url: share, label: nil), at: 0)
+                  saveSoon()
+              }
+
+              /// Background: find share links for movies on screen before you tap them.
+              private func queueRobot(_ m: Movie) {
+                  guard !m.hasVideo, m.externalLinks.isEmpty, !m.needsLookup, m.pageURL != nil,
+                        !robotTried.contains(m.id), !robotQueue.contains(m.id) else { return }
+                  robotQueue.append(m.id)
+                  pumpRobot()
+              }
+
+              private func pumpRobot() {
+                  guard backgroundRobot == nil, robot == nil, prepareJob == nil, nowPlaying == nil,
+                        !robotQueue.isEmpty else { return }
+                  let id = robotQueue.removeFirst()
+                  robotTried.insert(id)
+                  guard let m = movie(id), m.externalLinks.isEmpty, !m.hasVideo, let page = m.pageURL else { pumpRobot(); return }
+                  let r = BrowserRobot(rules: Rules.load()) { _ in }
+                  backgroundRobot = r
+                  Task {
+                      let result = await r.run(page: page, share: nil, stopAtShare: true)
+                      if let share = result.share {
+                          self.remember(share: share, for: id, service: Rules.load().externalServices?.first?.name ?? "FebBox")
+                      }
+                      self.backgroundRobot = nil
+                      self.pumpRobot()
+                  }
+              }
+
               func play(_ movie: Movie, url: URL? = nil, fromStart: Bool = false) {
                   guard let u = url ?? movie.bestVideo(canPlayAnything: PlaybackSupport.vlc) else { return }
                   var start = 0.0
@@ -2120,6 +2192,17 @@ jobs:
                   .fullScreenCover(item: $store.nowPlaying) { request in
                       PlayerView(request: request).environmentObject(store)
                   }
+                  .background(
+                      Color.clear.fullScreenCover(item: $store.prepareJob) { job in
+                          PrepareAndPlayView(job: job).environmentObject(store)
+                      }
+                  )
+                  .overlay {
+                      if let status = store.robotStatus {
+                          RobotOverlay(status: status) { store.cancelRobot() }
+                      }
+                  }
+                  .animation(.easeInOut(duration: 0.2), value: store.robotStatus)
                   .sheet(item: $store.webSession) { session in
                       WebBrowserView(session: session).environmentObject(store)
                   }
@@ -2478,6 +2561,39 @@ jobs:
                       }
                       .padding(20)
                   }
+              }
+          }
+
+
+          /// Shown while CineScout clicks through a site to find a movie's video.
+          struct RobotOverlay: View {
+              let status: String
+              let cancel: () -> Void
+
+              var body: some View {
+                  ZStack {
+                      Color.black.opacity(0.7).ignoresSafeArea()
+                      VStack(spacing: 16) {
+                          ProgressView().controlSize(.large).tint(.white)
+                          Text("Finding your video")
+                              .font(.title3.weight(.bold))
+                          Text(status)
+                              .font(.subheadline)
+                              .foregroundStyle(.secondary)
+                              .multilineTextAlignment(.center)
+                              .animation(nil, value: status)
+                          Text("This usually takes 10–30 seconds.")
+                              .font(.caption)
+                              .foregroundStyle(.tertiary)
+                          BigButton(title: "Cancel", prominent: false, action: cancel)
+                              .frame(maxWidth: 220)
+                      }
+                      .padding(28)
+                      .frame(maxWidth: 340)
+                      .background(Color(white: 0.1), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                      .foregroundStyle(.white)
+                  }
+                  .transition(.opacity)
               }
           }
           CINESCOUT_EOF
@@ -3834,6 +3950,408 @@ jobs:
           }
           CINESCOUT_EOF
 
+          # ---- Robot.swift
+          cat > 'CineScout/Sources/Robot.swift' <<'CINESCOUT_EOF'
+          import Foundation
+          import UIKit
+          import WebKit
+
+          /// A hidden browser that does what you'd do by hand on sites where Watch now / Download
+          /// are JavaScript buttons: open the movie's page, click through, wait for the FebBox
+          /// share page (refusing any other FebBox address), then find the video file there.
+          @MainActor
+          final class BrowserRobot: NSObject, WKNavigationDelegate, WKUIDelegate {
+              struct Result {
+                  var share: URL?
+                  var videos: [URL] = []
+                  var cookies: [HTTPCookie] = []
+                  var headers: [String: String] = [:]
+              }
+
+              private enum Goal { case findShare, findVideo }
+
+              private let webView: WKWebView
+              private var holder: UIView?
+              private let status: (String) -> Void
+              private let rules: Rules
+              private let service: ExternalService?
+              private let serviceHost: NSRegularExpression?
+              private let accept: NSRegularExpression?
+              private let videoExts: Set<String> = ["mp4", "m4v", "mov", "mkv", "webm", "avi", "m3u8", "ts", "m2ts", "wmv"]
+
+              private var goal: Goal = .findShare
+              private var stopAtShare = false
+              private var share: URL?
+              private var videos: [URL] = []
+              private var clicked: [String] = []
+              private var siteBase: String?
+              private var finished = false
+              private var waiter: CheckedContinuation<Void, Never>?
+              private var loop: Task<Void, Never>?
+              private var timeout: Task<Void, Never>?
+
+              init(rules: Rules, status: @escaping (String) -> Void) {
+                  self.rules = rules.resolved
+                  self.status = status
+                  let svc = rules.resolved.externalServices?.first
+                  self.service = svc
+                  self.serviceHost = Scraper.regex(svc?.hostPattern, name: "hostPattern")
+                  self.accept = Scraper.regex(svc?.acceptPattern, name: "acceptPattern")
+
+                  let config = WKWebViewConfiguration()
+                  config.websiteDataStore = .default()          // shares your FebBox sign-in with the visible browser
+                  config.allowsInlineMediaPlayback = true
+                  config.mediaTypesRequiringUserActionForPlayback = .all
+                  webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 390, height: 844), configuration: config)
+                  super.init()
+
+                  let content = config.userContentController
+                  // Pop-up windows report their address instead of opening.
+                  let popups = """
+                  (function () {
+                    window.open = function (u) {
+                      try { window.webkit.messageHandlers.robot.postMessage('open:' + new URL(u, location.href).href); } catch (e) {}
+                      return null;
+                    };
+                  })();
+                  """
+                  content.addUserScript(WKUserScript(source: popups, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+                  content.addUserScript(WKUserScript(source: WebModel.sniffer, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+                  let handler = RobotMessageHandler(self)
+                  content.add(handler, name: "robot")
+                  content.add(handler, name: "cinescout")
+                  webView.navigationDelegate = self
+                  webView.uiDelegate = self
+                  webView.customUserAgent = Scraper.userAgent
+              }
+
+              // MARK: Run
+
+              /// - Parameters:
+              ///   - page: the movie's page on your site (used when the share link isn't known yet)
+              ///   - share: a known FebBox share link (skips straight to finding the video)
+              ///   - stopAtShare: background mode — stop once the share link is found
+              func run(page: URL?, share knownShare: URL?, stopAtShare: Bool = false) async -> Result {
+                  self.stopAtShare = stopAtShare
+                  attachOffscreen()
+                  defer { detach() }
+
+                  if let knownShare {
+                      share = knownShare
+                      goal = .findVideo
+                      say("Opening the FebBox share page…")
+                      webView.load(URLRequest(url: knownShare))
+                  } else if let page {
+                      siteBase = page.host.map(Scraper.baseDomain)
+                      goal = .findShare
+                      say("Opening the movie's page…")
+                      webView.load(URLRequest(url: page))
+                  } else {
+                      return Result()
+                  }
+                  DiagLog.shared.log("robot", "Start: \(knownShare?.absoluteString ?? page?.absoluteString ?? "")")
+
+                  let limit = UInt64(max(15, min(rules.robotTimeout ?? 45, 180)))
+                  timeout = Task { [weak self] in
+                      try? await Task.sleep(nanoseconds: limit * 1_000_000_000)
+                      guard let self, !Task.isCancelled else { return }
+                      DiagLog.shared.log("robot", "Gave up after \(limit)s (share: \(self.share?.absoluteString ?? "not found"), videos: \(self.videos.count)).")
+                      self.finish()
+                  }
+                  loop = Task { [weak self] in
+                      try? await Task.sleep(nanoseconds: 1_500_000_000)
+                      while let self, !self.finished, !Task.isCancelled {
+                          await self.probe()
+                          try? await Task.sleep(nanoseconds: 1_200_000_000)
+                      }
+                  }
+                  await withCheckedContinuation { c in
+                      if finished { c.resume() } else { waiter = c }
+                  }
+
+                  var result = Result(share: share, videos: videos)
+                  if let v = videos.first {
+                      let all = await webView.configuration.websiteDataStore.httpCookieStore.allCookies()
+                      let host = v.host?.lowercased() ?? ""
+                      result.cookies = all.filter { c in
+                          let d = c.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+                          return host == d || host.hasSuffix("." + d)
+                      }
+                      if let ref = webView.url?.absoluteString { result.headers["Referer"] = ref }
+                      result.headers["User-Agent"] = Scraper.userAgent
+                  }
+                  DiagLog.shared.log("robot", "Done: share \(share?.absoluteString ?? "none"), \(videos.count) video(s).")
+                  return result
+              }
+
+              func cancel() {
+                  DiagLog.shared.log("robot", "Cancelled.")
+                  finish()
+              }
+
+              private func finish() {
+                  guard !finished else { return }
+                  finished = true
+                  loop?.cancel()
+                  timeout?.cancel()
+                  webView.stopLoading()
+                  waiter?.resume()
+                  waiter = nil
+              }
+
+              private func say(_ text: String) {
+                  status(text)
+                  DiagLog.shared.debug("robot", text)
+              }
+
+              // MARK: Found things
+
+              private func foundShare(_ url: URL) {
+                  guard share == nil else { return }
+                  share = url
+                  say("Found the FebBox share page.")
+                  DiagLog.shared.log("robot", "Share link: \(url.absoluteString)")
+                  if stopAtShare {
+                      finish()
+                      return
+                  }
+                  goal = .findVideo
+                  clicked.removeAll()
+                  say("Opening the FebBox share page…")
+                  webView.load(URLRequest(url: url))
+              }
+
+              private func foundVideo(_ url: URL) {
+                  guard !videos.contains(url) else { return }
+                  videos.append(url)
+                  DiagLog.shared.log("robot", "Video: \(url.absoluteString)")
+                  if goal == .findVideo {
+                      say("Found the video.")
+                      finish()
+                  }
+              }
+
+              func message(_ name: String, _ body: String) {
+                  if body.hasPrefix("open:") {
+                      guard let u = URL(string: String(body.dropFirst(5))) else { return }
+                      if isAcceptedShare(u) { foundShare(u) } else if isSameSite(u) { webView.load(URLRequest(url: u)) }
+                      return
+                  }
+                  // Stream requests seen by the sniffer
+                  // (Ignored while still on your site, so a trailer playing there isn't mistaken for the movie.)
+                  guard goal == .findVideo, let u = URL(string: body), videoExts.contains(u.pathExtension.lowercased()) else { return }
+                  foundVideo(u)
+              }
+
+              // MARK: Each step
+
+              private func probe() async {
+                  if goal == .findShare {
+                      if let u = webView.url, isAcceptedShare(u) { foundShare(u); return }
+                      let out = await evaluate(findShareJS())
+                      if let s = out["share"] as? String, let u = URL(string: s), isAcceptedShare(u) {
+                          foundShare(u)
+                      } else if let c = out["clicked"] as? String {
+                          clicked.append(c)
+                          say("Clicking “\(c.components(separatedBy: "|").first ?? c)”…")
+                          if clicked.count > 10 { DiagLog.shared.log("robot", "Clicked 10 times without reaching a share page.") }
+                      }
+                  } else {
+                      let out = await evaluate(findVideoJS())
+                      if let list = out["videos"] as? [String] {
+                          for s in list { if let u = URL(string: s) { foundVideo(u) } }
+                      } else if let c = out["clicked"] as? String {
+                          clicked.append(c)
+                          say("Opening “\(c.components(separatedBy: "|").first ?? c)”…")
+                      }
+                  }
+                  if let extra = rules.robotScript, !extra.isEmpty {
+                      _ = try? await webView.evaluateJavaScript(extra + "\n;true")
+                  }
+              }
+
+              private func evaluate(_ js: String) async -> [String: Any] {
+                  guard let text = try? await webView.evaluateJavaScript(js) as? String,
+                        let obj = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any] else { return [:] }
+                  return obj
+              }
+
+              private static func jsRegex(_ pattern: String?) -> String {
+                  var p = pattern ?? ""
+                  if p.hasPrefix("(?i)") { p.removeFirst(4) }
+                  let data = (try? JSONEncoder().encode(p)) ?? Data("\"\"".utf8)
+                  return String(decoding: data, as: UTF8.self)
+              }
+
+              private var clickedJSON: String {
+                  let data = (try? JSONEncoder().encode(clicked)) ?? Data("[]".utf8)
+                  return String(decoding: data, as: UTF8.self)
+              }
+
+              private func findShareJS() -> String {
+                  """
+                  (function (acceptSrc, searchSrc, clickSrc, clicked) {
+                    const acc = new RegExp(acceptSrc, 'i');
+                    const found = [];
+                    const add = (u) => { try { if (!u) return; u = new URL(u, location.href).href; if (acc.test(u)) found.push(u); } catch (e) {} };
+                    add(location.href);
+                    document.querySelectorAll('a[href], iframe[src], [data-href], [data-url], [data-link]').forEach(e =>
+                      add(e.getAttribute('href') || e.getAttribute('src') || e.getAttribute('data-href') || e.getAttribute('data-url') || e.getAttribute('data-link')));
+                    try {
+                      const html = document.documentElement.outerHTML.split('\\\\/').join('/');
+                      const re = new RegExp(searchSrc, 'gi');
+                      (html.match(re) || []).forEach(add);
+                    } catch (e) {}
+                    if (found.length) return JSON.stringify({ share: found[0] });
+                    const cre = new RegExp(clickSrc, 'i');
+                    const els = Array.from(document.querySelectorAll('a, button, [role=button], input[type=button], input[type=submit], [onclick]'));
+                    for (const el of els) {
+                      const t = ((el.innerText || el.value || el.getAttribute('aria-label') || el.title || '') + '').replace(/\\s+/g, ' ').trim();
+                      if (!t || t.length > 50 || !cre.test(t)) continue;
+                      const r = el.getBoundingClientRect();
+                      if (r.width === 0 && r.height === 0) continue;
+                      const sig = t + '|' + (el.getAttribute('href') || el.id || el.className || '');
+                      if (clicked.indexOf(sig) >= 0) continue;
+                      el.scrollIntoView({ block: 'center' });
+                      el.click();
+                      return JSON.stringify({ clicked: sig });
+                    }
+                    return '{}';
+                  })(\(Self.jsRegex(service?.acceptPattern)), \(Self.jsRegex(service?.searchPattern)), \(Self.jsRegex(rules.robotClickPattern)), \(clickedJSON))
+                  """
+              }
+
+              private func findVideoJS() -> String {
+                  """
+                  (function (clickSrc, clicked) {
+                    const ext = /\\.(mp4|m4v|mov|mkv|webm|avi|m3u8|ts|m2ts|wmv)(\\?|#|$)/i;
+                    const vids = [];
+                    document.querySelectorAll('a[href], video, video source, source, [data-src], [data-url]').forEach(e => {
+                      const u = e.currentSrc || e.src || e.getAttribute('href') || e.getAttribute('data-src') || e.getAttribute('data-url');
+                      if (!u) return;
+                      try { const a = new URL(u, location.href).href; if (/^https?:/i.test(a) && ext.test(a)) vids.push(a); } catch (x) {}
+                    });
+                    if (vids.length) return JSON.stringify({ videos: vids });
+                    const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 || r.height > 0; };
+                    const fileName = /\\.(mp4|m4v|mov|mkv|webm|avi|ts|m2ts|wmv)\\b/i;
+                    const btn = new RegExp(clickSrc, 'i');
+                    const all = Array.from(document.querySelectorAll('a, button, [role=button], [onclick], li, div, span, p, td'));
+                    const pick = (test) => {
+                      for (const el of all) {
+                        if (el.children.length > 4) continue;
+                        const t = ((el.innerText || el.value || '') + '').replace(/\\s+/g, ' ').trim();
+                        if (!t || t.length > 140 || !test(t) || !visible(el)) continue;
+                        const sig = t.slice(0, 80) + '|' + (el.getAttribute('href') || el.getAttribute('data-id') || el.className || '');
+                        if (clicked.indexOf(sig) >= 0) continue;
+                        el.scrollIntoView({ block: 'center' });
+                        el.click();
+                        return sig;
+                      }
+                      return null;
+                    };
+                    const s = pick(t => fileName.test(t)) || pick(t => btn.test(t));
+                    return s ? JSON.stringify({ clicked: s }) : '{}';
+                  })(\(Self.jsRegex(rules.robotClickPattern)), \(clickedJSON))
+                  """
+              }
+
+              // MARK: Where the page may go
+
+              private func isServiceSite(_ u: URL) -> Bool {
+                  guard let h = u.host?.lowercased() else { return false }
+                  return Scraper.matches(serviceHost, h)
+              }
+
+              private func isAcceptedShare(_ u: URL) -> Bool {
+                  isServiceSite(u) && (accept == nil || Scraper.matches(accept, u.absoluteString))
+              }
+
+              private func isSameSite(_ u: URL) -> Bool {
+                  guard let h = u.host?.lowercased(), let siteBase else { return false }
+                  return Scraper.baseDomain(h) == siteBase
+              }
+
+              func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction) async -> WKNavigationActionPolicy {
+                  guard let url = navigationAction.request.url else { return .allow }
+                  if videoExts.contains(url.pathExtension.lowercased()) {
+                      foundVideo(url)
+                      return .cancel
+                  }
+                  let mainFrame = navigationAction.targetFrame?.isMainFrame ?? true
+                  guard mainFrame else { return .allow }
+                  if isServiceSite(url) {
+                      if isAcceptedShare(url) {
+                          if goal == .findShare {
+                              foundShare(url)
+                              return stopAtShare ? .cancel : .allow
+                          }
+                          return .allow
+                      }
+                      // Any other FebBox address: refused, unless it's a file we clicked on the share page.
+                      if goal == .findVideo && navigationAction.navigationType == .linkActivated { return .allow }
+                      DiagLog.shared.log("robot", "Refused \(url.absoluteString) (not a share page)")
+                      return .cancel
+                  }
+                  return .allow
+              }
+
+              func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse) async -> WKNavigationResponsePolicy {
+                  let r = navigationResponse.response
+                  let mime = (r.mimeType ?? "").lowercased()
+                  let disposition = ((r as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Disposition") ?? "").lowercased()
+                  let named = disposition.range(of: #"filename\*?=[^;]*\.(mp4|m4v|mov|mkv|webm|avi|wmv|ts|m2ts)"#, options: .regularExpression) != nil
+                  if let url = r.url, mime.hasPrefix("video/") || mime.contains("mpegurl") || named
+                      || (mime.contains("octet-stream") && r.expectedContentLength > 50_000_000) {
+                      foundVideo(url)
+                      return .cancel
+                  }
+                  return .allow
+              }
+
+              func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                           for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+                  // New windows (often ads) are ignored unless they lead to the share page or stay on your site.
+                  if let url = navigationAction.request.url {
+                      if isAcceptedShare(url) { foundShare(url) } else if isSameSite(url) { webView.load(URLRequest(url: url)) }
+                  }
+                  return nil
+              }
+
+              // MARK: Hidden placement (pages need to be "on screen" for their scripts to run normally)
+
+              private func attachOffscreen() {
+                  guard let window = UIApplication.shared.connectedScenes
+                      .compactMap({ $0 as? UIWindowScene })
+                      .flatMap(\.windows)
+                      .first(where: \.isKeyWindow) else { return }
+                  let box = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+                  box.alpha = 0.01
+                  box.isUserInteractionEnabled = false
+                  box.addSubview(webView)
+                  window.insertSubview(box, at: 0)
+                  holder = box
+              }
+
+              private func detach() {
+                  webView.stopLoading()
+                  webView.removeFromSuperview()
+                  holder?.removeFromSuperview()
+                  holder = nil
+              }
+          }
+
+          @MainActor
+          final class RobotMessageHandler: NSObject, WKScriptMessageHandler {
+              weak var robot: BrowserRobot?
+              init(_ robot: BrowserRobot) { self.robot = robot }
+
+              func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+                  guard let s = message.body as? String else { return }
+                  robot?.message(message.name, s)
+              }
+          }
+          CINESCOUT_EOF
+
           # ---- Rules.swift
           cat > 'CineScout/Sources/Rules.swift' <<'CINESCOUT_EOF'
           import Foundation
@@ -3926,9 +4444,16 @@ jobs:
               /// false (default): scans stay fast and each movie's play links are opened only when
               /// the movie appears on screen or you open it. true: open them all during the scan.
               var resolvePlayLinksDuringScan: Bool?
+              /// Hidden-browser clicks: button text to click on the way to the share page
+              /// (Watch now, Download…).
+              var robotClickPattern: String?
+              /// Seconds the hidden browser may spend on one movie.
+              var robotTimeout: Int?
+              /// Optional JavaScript run on every page the hidden browser visits (site-specific fixes).
+              var robotScript: String?
 
               static let defaults = Rules(
-                  version: 7,
+                  version: 8,
                   note: "CineScout scanner rules. Claude can send you a new version of this file: paste it in Diagnostics → Scanner rules, save, then rescan. Optional `script` is JavaScript defining extract(html, url) that returns {title, year, overview, poster, videos: [], playLinks: [], links: [], isMovie}; call log(text) to write to the diagnostic log.",
                   playLabelPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:play|watch|stream|view online|start watching|resume|download|direct link|mirror|server)\b|\b(?:2160p|1080p|720p|480p|4k|full movie)\b|^\s*[▶►⏵]"#,
                   genericLabelPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:play|play now|watch|watch now|watch online|watch movie|watch free|stream|stream now|view|download|download now|direct link|link|here|click here|more|more info|info|details|trailer|open|start|resume|next|previous|prev|back|home|menu|login|log in|sign in|register|search|parent directory|\.\./?|name|last modified|size|description|(?:server|mirror|source|part|episode|ep|season|page)\s*#?\d*|\d{3,4}p|4k|uhd|hd|sd|mp4|mkv|m3u8|open in \S+(?: app)?|»|«|›|‹|\d{1,2})\s*$"#,
@@ -3960,7 +4485,10 @@ jobs:
                   chainLabelPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:continue|proceed|next|next step|go|go to (?:the )?(?:video|movie|file|link|download)|get (?:the )?(?:link|video|file)|generate (?:download )?link|click (?:here )?to (?:watch|play|stream|continue|download|proceed)|start (?:download|streaming|watching)|download (?:now|file|video|movie)|direct (?:link|download)|watch (?:now|here|online|movie|full movie)|play (?:now|video|movie)|stream (?:now|here)|open (?:video|player|file)|(?:server|mirror|source|link|player|host|option)\s*#?\d+|hd|full ?hd|\d{3,4}p)\b"#,
                   maxPlayHops: 5,
                   excludeVideoPattern: #"(?i)(?:^|[\s._\-\[(/])(?:trailers?|teasers?|samples?|featurettes?|behind[\s._-]the[\s._-]scenes|deleted[\s._-]scenes?|extras|bonus[\s._-]?features?|making[\s._-]of|bloopers?)(?:[\s._\-\])/]|$)"#,
-                  resolvePlayLinksDuringScan: false
+                  resolvePlayLinksDuringScan: false,
+                  robotClickPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:watch now|watch online|watch movie|watch|play now|play movie|play|download now|download movie|download|direct download|get (?:download )?link|go to download|continue|click here to (?:watch|download|continue))(?:\s.{0,25})?$"#,
+                  robotTimeout: 45,
+                  robotScript: ""
               )
 
               /// These rules with built-in defaults filled in for anything missing.
@@ -3988,7 +4516,10 @@ jobs:
                       chainLabelPattern: chainLabelPattern ?? d.chainLabelPattern,
                       maxPlayHops: maxPlayHops ?? d.maxPlayHops,
                       excludeVideoPattern: excludeVideoPattern ?? d.excludeVideoPattern,
-                      resolvePlayLinksDuringScan: resolvePlayLinksDuringScan ?? d.resolvePlayLinksDuringScan
+                      resolvePlayLinksDuringScan: resolvePlayLinksDuringScan ?? d.resolvePlayLinksDuringScan,
+                      robotClickPattern: robotClickPattern ?? d.robotClickPattern,
+                      robotTimeout: robotTimeout ?? d.robotTimeout,
+                      robotScript: robotScript ?? d.robotScript
                   )
               }
 
@@ -4087,6 +4618,7 @@ jobs:
                       ("labelStripPattern", r.labelStripPattern), ("playHrefPattern", r.playHrefPattern),
                       ("playClassPattern", r.playClassPattern), ("skipHrefPattern", r.skipHrefPattern),
                       ("chainLabelPattern", r.chainLabelPattern), ("excludeVideoPattern", r.excludeVideoPattern),
+                      ("robotClickPattern", r.robotClickPattern),
                   ]
                   var allPatterns = patterns
                   for svc in r.externalServices ?? [] {
@@ -4378,7 +4910,7 @@ jobs:
                   return result
               }
 
-              /// Fetches queued pages six at a time until the queue is empty or the page limit is hit.
+              /// Fetches queued pages ten at a time until the queue is empty or the page limit is hit.
               /// Returns the start page's error, if it failed.
               private func crawl(progress: (@Sendable (ScanProgress) async -> Void)?) async -> Error? {
                   var rootError: Error?
@@ -4386,12 +4918,12 @@ jobs:
 
                   while !queue.isEmpty && pages < maxPages {
                       if Task.isCancelled { cancelled = true; break }
-                      let take = min(6, queue.count, max(1, maxPages - pages))
+                      let take = min(10, queue.count, max(1, maxPages - pages))
                       let batch = Array(queue.prefix(take))
                       queue.removeFirst(take)
                       if let progress {
                           var p = ScanProgress(pages: pages, found: foundCount, status: Self.shortName(batch[0].0))
-                          if Date().timeIntervalSince(lastSnapshot) > 4 {
+                          if Date().timeIntervalSince(lastSnapshot) > 2 {
                               lastSnapshot = Date()
                               p.snapshot = quickSnapshot()
                           }
@@ -5450,7 +5982,7 @@ jobs:
               // MARK: Networking
 
               static func fetch(_ url: URL) async -> Fetched {
-                  var req = URLRequest(url: url, timeoutInterval: 20)
+                  var req = URLRequest(url: url, timeoutInterval: 12)
                   req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
                   req.setValue("text/html,application/xhtml+xml,*/*;q=0.8", forHTTPHeaderField: "Accept")
                   do {
@@ -6093,7 +6625,7 @@ jobs:
               private static let videoExts: Set<String> = ["mp4", "m4v", "mov", "mkv", "webm", "avi", "wmv", "ts", "m2ts", "m3u8", "mpg", "mpeg"]
 
               /// Watches the page's own requests for video streams (hls.js, fetch, XHR, <video>).
-              private static let sniffer = """
+              static let sniffer = """
               (function () {
                 if (window.__cinescout) return; window.__cinescout = true;
                 const re = /\\.(m3u8|mp4|m4v|mov|mkv|webm)(\\?|#|$)/i;
