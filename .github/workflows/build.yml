@@ -259,6 +259,32 @@ jobs:
               func prefetching(_ movie: Movie) -> some View { modifier(PrefetchOnScreen(movie: movie)) }
           }
 
+          /// A checkmark for watched movies and a bar for ones you're partway through.
+          struct WatchBadge: View {
+              let movie: Movie
+              @EnvironmentObject private var store: LibraryStore
+
+              var body: some View {
+                  ZStack {
+                      if store.isFinished(movie.id) {
+                          Image(systemName: "checkmark.circle.fill")
+                              .font(.system(size: 18, weight: .semibold))
+                              .symbolRenderingMode(.palette)
+                              .foregroundStyle(.white, .black.opacity(0.55))
+                              .padding(6)
+                              .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                              .accessibilityLabel("Watched")
+                      }
+                      if let p = store.progressFraction(movie.id) {
+                          ProgressBar(value: p)
+                              .padding(.horizontal, 8).padding(.bottom, 8)
+                              .frame(maxHeight: .infinity, alignment: .bottom)
+                      }
+                  }
+                  .allowsHitTesting(false)
+              }
+          }
+
           struct PosterCard: View {
               let movie: Movie
               var width: CGFloat = 118
@@ -266,6 +292,7 @@ jobs:
               var body: some View {
                   VStack(alignment: .leading, spacing: 6) {
                       Artwork(movie: movie, aspect: 2.0 / 3.0)
+                          .overlay { WatchBadge(movie: movie) }
                       Text(movie.title)
                           .font(.caption.weight(.semibold))
                           .lineLimit(1)
@@ -352,6 +379,7 @@ jobs:
                           NavigationLink(value: m) {
                               VStack(alignment: .leading, spacing: 6) {
                                   Artwork(movie: m, aspect: 2.0 / 3.0)
+                                      .overlay { WatchBadge(movie: m) }
                                   Text(m.title).font(.caption.weight(.semibold)).lineLimit(2)
                                   if let y = m.year { Text(y).font(.caption2).foregroundStyle(.secondary) }
                               }
@@ -418,6 +446,7 @@ jobs:
 
               /// One tap does everything: finds the video (clicking through the site if needed) and plays it.
               private func tap() {
+                  UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                   Task { await store.playSmart(movie) }
               }
           }
@@ -517,6 +546,25 @@ jobs:
                   }
                   .padding(32)
                   .frame(maxWidth: .infinity, maxHeight: .infinity)
+              }
+          }
+
+          /// The look of BigButton, for use inside a NavigationLink.
+          struct BigButtonLabel: View {
+              let title: String
+              var systemImage: String? = nil
+              var prominent = true
+
+              var body: some View {
+                  HStack(spacing: 8) {
+                      if let systemImage { Image(systemName: systemImage) }
+                      Text(title)
+                  }
+                  .font(.headline)
+                  .frame(maxWidth: .infinity)
+                  .frame(height: 54)
+                  .foregroundStyle(prominent ? .black : .white)
+                  .background(prominent ? Color.white : Color(white: 0.18), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
               }
           }
 
@@ -684,7 +732,7 @@ jobs:
                   return (lines.isEmpty ? "Nothing to do in that patch." : lines.joined(separator: "\n"), ok)
               }
 
-              private static let allowedSettings: Set<String> = ["maxPages", "compressQuality", "verboseLog", "sortMode"]
+              private static let allowedSettings: Set<String> = ["maxPages", "compressQuality", "verboseLog", "sortMode", "showCompressSettings"]
 
               private func setSetting(_ key: String, _ value: Any) -> String {
                   guard Self.allowedSettings.contains(key) else { return "Unknown setting: \(key)" }
@@ -961,13 +1009,6 @@ jobs:
                                   }
                               }
                           }
-                          if let src = m.pageURL ?? m.videoURLs.first ?? m.externalLinks.first?.url {
-                              Text(src.absoluteString)
-                                  .font(.caption2)
-                                  .foregroundStyle(.tertiary)
-                                  .textSelection(.enabled)
-                                  .padding(.horizontal, 20)
-                          }
                       }
                       .padding(.bottom, 40)
                   }
@@ -1007,7 +1048,7 @@ jobs:
                           }
                           PlayButton(movie: m, fullWidth: true)
                               .padding(.top, 4)
-                          if m.hasVideo, let fraction = store.progressFraction(m.id) {
+                          if let fraction = store.progressFraction(m.id) {
                               HStack(spacing: 10) {
                                   ProgressBar(value: fraction).frame(width: 90)
                                   Text(store.remainingText(m.id) ?? "").font(.caption).foregroundStyle(.secondary)
@@ -1042,6 +1083,14 @@ jobs:
               private func actions(_ m: Movie) -> some View {
                   ScrollView(.horizontal, showsIndicators: false) {
                       HStack(alignment: .top, spacing: 14) {
+                          let watched = store.isFinished(m.id)
+                          Button {
+                              store.markWatched(m.id, !watched)
+                              UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                          } label: {
+                              CircleAction(title: watched ? "Watched" : "Mark Watched", systemImage: watched ? "checkmark.circle.fill" : "checkmark.circle")
+                          }
+                          .accessibilityLabel(watched ? "Watched. Tap to mark as not watched." : "Mark as watched")
                           if let video = m.bestVideo(canPlayAnything: PlaybackSupport.vlc) {
                               ForEach(ExternalPlayer.allCases) { player in
                                   Button { open(player.url(for: video), missing: player.missingMessage) } label: {
@@ -1482,6 +1531,8 @@ jobs:
               @Published private(set) var movies: [Movie] = []
               @Published private(set) var sites: [Site] = []
               @Published private(set) var progress: [String: WatchProgress] = [:]
+              /// Everything you've watched (or started), newest first, kept after you finish.
+              @Published private(set) var history: [String: WatchEntry] = [:]
               @Published var scanState: ScanState = .idle
               @Published var nowPlaying: PlayRequest?
               @Published var webSession: WebSession?
@@ -1509,10 +1560,15 @@ jobs:
               }
 
               private var scanTask: Task<Void, Never>?
+              private var searchTask: Task<Void, Never>?
+              private var searchedQueries: [String: Date] = [:]
+              /// True while the search tab is quietly checking your websites for more matches.
+              @Published private(set) var isSearchingSites = false
               private var currentScan = UUID()
               private static let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
               private let fileURL = LibraryStore.docs.appendingPathComponent("library.json")
               private let progressURL = LibraryStore.docs.appendingPathComponent("progress.json")
+              private let historyURL = LibraryStore.docs.appendingPathComponent("history.json")
 
               private struct Saved: Codable {
                   var movies: [Movie]
@@ -1541,6 +1597,40 @@ jobs:
 
               var recentlyAdded: [Movie] {
                   Array(movies.sorted { $0.addedAt > $1.addedAt }.prefix(20))
+              }
+
+              /// Movies you've watched or started, most recent first.
+              var recentlyWatched: [Movie] {
+                  movies(history.sorted { $0.value.lastWatched > $1.value.lastWatched }.map(\.key))
+              }
+
+              func isFinished(_ id: String) -> Bool { history[id]?.finished == true }
+
+              func removeFromHistory(_ id: String) {
+                  history[id] = nil
+                  progress[id] = nil
+                  saveWatchData()
+              }
+
+              func clearHistory() {
+                  history = [:]
+                  progress = [:]
+                  saveWatchData()
+              }
+
+              func markWatched(_ id: String, _ watched: Bool) {
+                  if watched {
+                      history[id] = WatchEntry(lastWatched: Date(), finished: true)
+                      progress[id] = nil
+                  } else {
+                      history[id]?.finished = false
+                  }
+                  saveWatchData()
+              }
+
+              private func saveWatchData() {
+                  if let data = try? JSONEncoder().encode(progress) { try? data.write(to: progressURL, options: .atomic) }
+                  if let data = try? JSONEncoder().encode(history) { try? data.write(to: historyURL, options: .atomic) }
               }
 
               var continueWatching: [Movie] {
@@ -1949,15 +2039,17 @@ jobs:
                   guard position.isFinite, duration.isFinite else { return }
                   if duration > 0 && position >= duration * 0.95 {
                       progress[id] = nil
+                      history[id] = WatchEntry(lastWatched: Date(), finished: true)
                   } else if position > 10 {
                       progress[id] = WatchProgress(position: position, duration: duration, updated: Date())
+                      history[id] = WatchEntry(lastWatched: Date(), finished: history[id]?.finished ?? false)
                   }
-                  if let data = try? JSONEncoder().encode(progress) { try? data.write(to: progressURL, options: .atomic) }
+                  saveWatchData()
               }
 
               func clearProgress(_ id: String) {
                   progress[id] = nil
-                  if let data = try? JSONEncoder().encode(progress) { try? data.write(to: progressURL, options: .atomic) }
+                  saveWatchData()
               }
 
               // MARK: Scanning
@@ -2120,8 +2212,12 @@ jobs:
                           fresh[i].pendingLinks = []
                       }
                   }
+                  // Movies found by searching stay, even if the full scan didn't reach them.
+                  let freshIDs = Set(fresh.map(\.id))
+                  let searched = previous.values.filter { $0.fromSearch == true && !freshIDs.contains($0.id) }
                   movies.removeAll { $0.source == key }
                   movies.append(contentsOf: fresh)
+                  movies.append(contentsOf: searched)
                   movies.sort { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
 
                   if let i = sites.firstIndex(where: { $0.url.absoluteString == key }) {
@@ -2202,6 +2298,57 @@ jobs:
                   return error.localizedDescription
               }
 
+              // MARK: Search your websites as you type
+
+              /// Quietly searches each website (its own search page if it has one) for titles like `query`
+              /// and adds what it finds to the library, so search results just appear.
+              func searchSites(_ query: String) {
+                  let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+                  searchTask?.cancel()
+                  guard q.count >= 2, !sites.isEmpty else { isSearchingSites = false; return }
+                  let norm = Fuzzy.tokens(q).joined(separator: " ")
+                  if let last = searchedQueries[norm], Date().timeIntervalSince(last) < 600 { return }
+                  let siteList = sites.map(\.url)
+                  searchTask = Task { [weak self] in
+                      try? await Task.sleep(nanoseconds: 450_000_000)   // wait until typing pauses
+                      guard let self, !Task.isCancelled else { return }
+                      self.isSearchingSites = true
+                      defer { if !Task.isCancelled { self.isSearchingSites = false } }
+                      var added = 0
+                      for site in siteList {
+                          guard !Task.isCancelled else { return }
+                          let key = site.absoluteString
+                          let start = await SiteSearch.url(for: site, query: q) ?? site
+                          let scraper = Scraper(root: start, maxPages: start == site ? 60 : 25, sourceKey: key,
+                                                rules: Rules.load(), focus: q, stayUnder: site)
+                          guard let result = try? await scraper.run(progress: { _ in }), !Task.isCancelled else { continue }
+                          added += self.mergeSearch(result.movies, query: q, key: key)
+                      }
+                      guard !Task.isCancelled else { return }
+                      self.searchedQueries[norm] = Date()
+                      DiagLog.shared.log("search", "“\(q)”: added \(added) new title(s) from your websites.")
+                  }
+              }
+
+              private func mergeSearch(_ found: [Movie], query: String, key: String) -> Int {
+                  let have = Set(movies.map(\.id))
+                  let haveTitles = Set(movies.filter { $0.source == key }.map { Fuzzy.tokens($0.title).joined(separator: " ") + "|" + ($0.year ?? "") })
+                  var fresh: [Movie] = []
+                  for var m in found where !have.contains(m.id) && Fuzzy.matches(query, m.title) {
+                      let t = Fuzzy.tokens(m.title).joined(separator: " ") + "|" + (m.year ?? "")
+                      guard !haveTitles.contains(t), !Scraper.notAMovie(m, rules: Rules.load()) else { continue }
+                      m.fromSearch = true
+                      m.source = key
+                      fresh.append(m)
+                  }
+                  guard !fresh.isEmpty else { return 0 }
+                  movies.append(contentsOf: fresh)
+                  movies.sort { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+                  if let i = sites.firstIndex(where: { $0.url.absoluteString == key }) { sites[i].movieCount += fresh.count }
+                  save()
+                  return fresh.count
+              }
+
               // MARK: Storage
 
               private func load() {
@@ -2222,6 +2369,14 @@ jobs:
                   if let data = try? Data(contentsOf: progressURL),
                      let p = try? JSONDecoder().decode([String: WatchProgress].self, from: data) {
                       progress = p
+                  }
+                  if let data = try? Data(contentsOf: historyURL),
+                     let h = try? JSONDecoder().decode([String: WatchEntry].self, from: data) {
+                      history = h
+                  }
+                  // Anything already in progress counts as watched recently.
+                  for (id, p) in progress where history[id] == nil {
+                      history[id] = WatchEntry(lastWatched: p.updated, finished: false)
                   }
                   cleanServiceLinks()
               }
@@ -2296,10 +2451,11 @@ jobs:
                       HomeView()
                           .tabItem { Label("Home", systemImage: "play.tv") }
                       LibraryView()
-                          .tabItem { Label("Library", systemImage: "square.stack.fill") }
+                          .tabItem { Label("Library", systemImage: "rectangle.stack.fill") }
                       SearchView()
                           .tabItem { Label("Search", systemImage: "magnifyingglass") }
                   }
+                  .tint(.white)
               }
           }
 
@@ -2494,15 +2650,166 @@ jobs:
 
           // MARK: Library
 
+          /// Your stuff: what you're in the middle of, what you've watched, and every movie.
           struct LibraryView: View {
               @EnvironmentObject private var store: LibraryStore
-              @AppStorage("sortMode") private var sortRaw = SortMode.title.rawValue
               @State private var showSettings = false
+              @State private var confirmClear = false
+
+              var body: some View {
+                  NavigationStack {
+                      ScrollView {
+                          VStack(alignment: .leading, spacing: 28) {
+                              ScanBanner().padding(.horizontal, 20)
+
+                              if !store.continueWatching.isEmpty {
+                                  Shelf(title: "Continue Watching") {
+                                      ForEach(store.continueWatching) { m in
+                                          Button { store.play(m) } label: {
+                                              WideCard(movie: m, progress: store.progressFraction(m.id), subtitle: store.remainingText(m.id))
+                                          }
+                                          .buttonStyle(PressableStyle())
+                                          .accessibilityHint("Resumes playing")
+                                          .contextMenu { historyMenu(m) }
+                                      }
+                                  }
+                              }
+
+                              if store.recentlyWatched.isEmpty {
+                                  EmptyStateView(systemImage: "clock.arrow.circlepath", title: "Nothing watched yet",
+                                                 message: "Movies you watch show up here, so you can find them again.") {
+                                      NavigationLink(value: ShelfRoute(title: "All Movies", ids: [])) {
+                                          BigButtonLabel(title: "Browse All Movies", systemImage: "film.stack")
+                                      }
+                                      .buttonStyle(PressableStyle())
+                                  }
+                                  .frame(minHeight: 360)
+                              } else {
+                                  VStack(alignment: .leading, spacing: 12) {
+                                      Text("Recently Watched").font(.title3.weight(.bold)).padding(.horizontal, 20)
+                                      LazyVStack(spacing: 0) {
+                                          ForEach(store.recentlyWatched.prefix(40)) { m in
+                                              NavigationLink(value: m) { HistoryRow(movie: m) }
+                                                  .buttonStyle(PressableStyle())
+                                                  .contextMenu { historyMenu(m) }
+                                          }
+                                      }
+                                      .padding(.horizontal, 20)
+                                  }
+                              }
+
+                              if !store.movies.isEmpty {
+                                  NavigationLink(value: ShelfRoute(title: "All Movies", ids: [])) {
+                                      HStack(spacing: 14) {
+                                          Image(systemName: "film.stack.fill").font(.title2).frame(width: 44)
+                                          VStack(alignment: .leading, spacing: 2) {
+                                              Text("All Movies").font(.headline)
+                                              Text("\(store.movies.count) on your websites").font(.caption).foregroundStyle(.secondary)
+                                          }
+                                          Spacer()
+                                          Image(systemName: "chevron.right").foregroundStyle(.secondary)
+                                      }
+                                      .padding(16)
+                                      .background(Color(white: 0.11), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                                      .foregroundStyle(.white)
+                                  }
+                                  .buttonStyle(PressableStyle())
+                                  .padding(.horizontal, 20)
+                              }
+                          }
+                          .padding(.vertical, 10)
+                          .padding(.bottom, 30)
+                      }
+                      .background(Color.black.ignoresSafeArea())
+                      .navigationTitle("Library")
+                      .toolbar {
+                          if !store.recentlyWatched.isEmpty {
+                              ToolbarItem(placement: .topBarLeading) {
+                                  Menu {
+                                      Button(role: .destructive) { confirmClear = true } label: {
+                                          Label("Clear Watch History", systemImage: "trash")
+                                      }
+                                  } label: { Image(systemName: "ellipsis.circle") }
+                                  .accessibilityLabel("More options")
+                              }
+                          }
+                          ToolbarItem(placement: .topBarTrailing) { SettingsButton(show: $showSettings) }
+                      }
+                      .confirmationDialog("Clear your watch history?", isPresented: $confirmClear, titleVisibility: .visible) {
+                          Button("Clear Watch History", role: .destructive) { store.clearHistory() }
+                          Button("Cancel", role: .cancel) {}
+                      } message: {
+                          Text("Your movies stay. Only the list of what you've watched (and where you stopped) is cleared.")
+                      }
+                      .movieDestinations()
+                      .sheet(isPresented: $showSettings) { SettingsView().environmentObject(store) }
+                  }
+              }
+
+              @ViewBuilder private func historyMenu(_ m: Movie) -> some View {
+                  Button { store.play(m) } label: {
+                      Label(store.progressFraction(m.id) != nil ? "Resume" : "Play", systemImage: "play.fill")
+                  }
+                  if store.progressFraction(m.id) != nil {
+                      Button { store.play(m, fromStart: true) } label: { Label("Start from Beginning", systemImage: "backward.end.fill") }
+                  }
+                  NavigationLink(value: m) { Label("Details", systemImage: "info.circle") }
+                  Button { store.markWatched(m.id, !store.isFinished(m.id)) } label: {
+                      Label(store.isFinished(m.id) ? "Mark as Not Watched" : "Mark as Watched", systemImage: "checkmark.circle")
+                  }
+                  Button(role: .destructive) { store.removeFromHistory(m.id) } label: {
+                      Label("Remove from History", systemImage: "eye.slash")
+                  }
+              }
+          }
+
+          /// One line in Recently Watched: poster, title, and how far you got.
+          struct HistoryRow: View {
+              let movie: Movie
+              @EnvironmentObject private var store: LibraryStore
+
+              var body: some View {
+                  HStack(spacing: 14) {
+                      Artwork(movie: movie, aspect: 16.0 / 9.0, corner: 8)
+                          .frame(width: 120)
+                          .overlay(alignment: .bottom) {
+                              if let p = store.progressFraction(movie.id) {
+                                  ProgressBar(value: p).padding(.horizontal, 8).padding(.bottom, 6)
+                              }
+                          }
+                      VStack(alignment: .leading, spacing: 4) {
+                          Text(movie.title).font(.subheadline.weight(.semibold)).lineLimit(2)
+                          Text(status).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                      }
+                      Spacer(minLength: 0)
+                      if store.isFinished(movie.id) {
+                          Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).accessibilityLabel("Watched")
+                      } else {
+                          Image(systemName: "chevron.right").font(.caption.weight(.bold)).foregroundStyle(.tertiary)
+                      }
+                  }
+                  .padding(.vertical, 8)
+                  .contentShape(Rectangle())
+                  .foregroundStyle(.white)
+              }
+
+              private var status: String {
+                  let when = store.history[movie.id]?.lastWatched.formatted(.relative(presentation: .named)) ?? ""
+                  if store.isFinished(movie.id) { return "Finished · \(when)" }
+                  if let left = store.remainingText(movie.id) { return "\(left) · \(when)" }
+                  return when.isEmpty ? movie.metaLine : "Started \(when)"
+              }
+          }
+
+          /// Every movie, with an easy sort switch at the top.
+          struct AllMoviesView: View {
+              @EnvironmentObject private var store: LibraryStore
+              @AppStorage("sortMode") private var sortRaw = SortMode.title.rawValue
 
               enum SortMode: String, CaseIterable, Identifiable {
-                  case title = "A to Z"
-                  case added = "Recently Added"
-                  case year = "Newest First"
+                  case title = "A–Z"
+                  case added = "Newest Added"
+                  case year = "Release Year"
                   var id: String { rawValue }
               }
 
@@ -2515,45 +2822,27 @@ jobs:
               }
 
               var body: some View {
-                  NavigationStack {
-                      Group {
+                  ScrollView {
+                      VStack(alignment: .leading, spacing: 16) {
+                          Picker("Sort", selection: $sortRaw) {
+                              ForEach(SortMode.allCases) { Text($0.rawValue).tag($0.rawValue) }
+                          }
+                          .pickerStyle(.segmented)
+                          Text("\(store.movies.count) movies").font(.subheadline).foregroundStyle(.secondary)
                           if store.movies.isEmpty {
-                              EmptyStateView(systemImage: "square.stack", title: "Nothing here yet",
-                                             message: "Movies from your website appear here after a scan.") {
-                                  BigButton(title: "Open Settings", systemImage: "gearshape") { showSettings = true }
-                              }
+                              EmptyStateView(systemImage: "film.stack", title: "No movies yet",
+                                             message: "Add your website in Settings and CineScout fills this in.") { EmptyView() }
                           } else {
-                              ScrollView {
-                                  ScanBanner().padding(.horizontal, 20)
-                                  Text("\(store.movies.count) movies")
-                                      .font(.subheadline)
-                                      .foregroundStyle(.secondary)
-                                      .frame(maxWidth: .infinity, alignment: .leading)
-                                      .padding(.horizontal, 20)
-                                  MovieGrid(movies: sorted).padding(.horizontal, 20).padding(.bottom, 30)
-                              }
-                              .refreshable {
-                                  store.rescanAll()
-                                  await store.waitForScan()
-                              }
+                              MovieGrid(movies: sorted)
                           }
                       }
-                      .background(Color.black.ignoresSafeArea())
-                      .navigationTitle("Library")
-                      .toolbar {
-                          ToolbarItem(placement: .topBarLeading) {
-                              Menu {
-                                  Picker("Sort", selection: $sortRaw) {
-                                      ForEach(SortMode.allCases) { Text($0.rawValue).tag($0.rawValue) }
-                                  }
-                              } label: {
-                                  Label("Sort", systemImage: "arrow.up.arrow.down")
-                              }
-                          }
-                          ToolbarItem(placement: .topBarTrailing) { SettingsButton(show: $showSettings) }
-                      }
-                      .movieDestinations()
-                      .sheet(isPresented: $showSettings) { SettingsView().environmentObject(store) }
+                      .padding(20)
+                  }
+                  .background(Color.black.ignoresSafeArea())
+                  .navigationTitle("All Movies")
+                  .refreshable {
+                      store.rescanAll()
+                      await store.waitForScan()
                   }
               }
           }
@@ -2563,6 +2852,14 @@ jobs:
               @EnvironmentObject private var store: LibraryStore
 
               var body: some View {
+                  if route.ids.isEmpty && route.title == "All Movies" {
+                      AllMoviesView()
+                  } else {
+                      shelfGrid
+                  }
+              }
+
+              private var shelfGrid: some View {
                   ScrollView {
                       MovieGrid(movies: store.movies(route.ids))
                           .padding(20)
@@ -2583,6 +2880,7 @@ jobs:
                   guard !q.isEmpty else { return [] }
                   return store.movies.filter { m in
                       m.title.localizedCaseInsensitiveContains(q)
+                          || Fuzzy.matches(q, m.title)
                           || (m.year ?? "") == q
                           || m.details.contains { $0.label != "File" && $0.value.localizedCaseInsensitiveContains(q) }
                           || (m.overview ?? "").localizedCaseInsensitiveContains(q)
@@ -2594,30 +2892,49 @@ jobs:
                       ScrollView {
                           if query.trimmingCharacters(in: .whitespaces).isEmpty {
                               browse
+                          } else if results.isEmpty && store.isSearchingSites {
+                              ProgressView().tint(.secondary).padding(.top, 60)
                           } else if results.isEmpty {
                               EmptyStateView(systemImage: "magnifyingglass", title: "No matches",
-                                             message: "Nothing in your library matches “\(query)”. Try fewer letters, or check the spelling.") {
+                                             message: "Nothing on your websites matches “\(query)”. Try fewer letters, or check the spelling.") {
                                   EmptyView()
                               }
                               .padding(.top, 40)
                           } else {
                               MovieGrid(movies: results).padding(20)
+                                  .animation(.easeOut(duration: 0.25), value: results.map(\.id))
                           }
                       }
                       .background(Color.black.ignoresSafeArea())
                       .navigationTitle("Search")
-                      .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Movies, actors, genres")
+                      .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search movies & shows")
                       .autocorrectionDisabled()
+                      .onChange(of: query) { _, q in store.searchSites(q) }
+                      .onSubmit(of: .search) { store.searchSites(query) }
                       .movieDestinations()
                   }
               }
 
               @ViewBuilder private var browse: some View {
                   let genres = store.allGenres
+                  let recent = Array(store.recentlyWatched.prefix(12))
+                  if !recent.isEmpty {
+                      Shelf(title: "Recently Watched") {
+                          ForEach(recent) { m in
+                              NavigationLink(value: m) { PosterCard(movie: m) }.buttonStyle(PressableStyle())
+                          }
+                      }
+                      .padding(.top, 12)
+                  }
                   if genres.isEmpty {
-                      Text("Type a movie name above.")
-                          .foregroundStyle(.secondary)
-                          .padding(.top, 60)
+                      VStack(spacing: 10) {
+                          Image(systemName: "magnifyingglass").font(.system(size: 44, weight: .light)).foregroundStyle(.secondary)
+                          Text("Type any part of a name").font(.headline)
+                          Text("CineScout searches your websites as you type, even movies it hasn't found yet. Small typos are fine.")
+                              .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                      }
+                      .padding(.horizontal, 32)
+                      .padding(.top, 60)
                   } else {
                       VStack(alignment: .leading, spacing: 14) {
                           Text("Browse by Genre").font(.title3.weight(.bold))
@@ -2705,6 +3022,8 @@ jobs:
               /// when the movie comes on screen or you open it, instead of during the scan.
               var pendingLinks: [URL] = []
               var addedAt: Date = Date()
+              /// Found by searching (beyond what the full scan reached); kept across rescans.
+              var fromSearch: Bool? = nil
           }
 
           extension Movie {
@@ -2779,6 +3098,12 @@ jobs:
               var lastScanned: Date?
               var movieCount: Int = 0
               var id: String { url.absoluteString }
+          }
+
+          /// One line of your watch history.
+          struct WatchEntry: Codable, Hashable, Sendable {
+              var lastWatched: Date
+              var finished: Bool
           }
 
           struct WatchProgress: Codable, Hashable, Sendable {
@@ -5602,14 +5927,18 @@ jobs:
 
               private var foundCount: Int { fileCandidates.count + pageEntries.count + externalCandidates.count }
 
-              init(root: URL, maxPages: Int, sourceKey: String, rules custom: Rules) {
+              /// When searching: only follow links whose label or address looks like the search words.
+              private let focus: String?
+
+              init(root: URL, maxPages: Int, sourceKey: String, rules custom: Rules, focus: String? = nil, stayUnder: URL? = nil) {
+                  self.focus = focus
                   let r = custom.resolved
                   self.root = root
                   self.maxPages = maxPages
                   self.sourceKey = sourceKey
                   self.rules = r
                   self.hosts = [root.host?.lowercased() ?? ""]
-                  self.pathPrefix = Scraper.directoryPath(of: root)
+                  self.pathPrefix = Scraper.directoryPath(of: stayUnder ?? root)
                   let extra = (r.extraVideoExtensions ?? [])
                       .map { $0.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: ". ")) }
                       .filter { !$0.isEmpty }
@@ -6424,6 +6753,7 @@ jobs:
                       var title = l.label
                       let poster = l.poster
                       if useContext && poster != nil && title == nil { title = cardContext(l.element, base: base).title }
+                      if let focus, !Fuzzy.matches(focus, (title ?? "") + " " + l.url.path.replacingOccurrences(of: "-", with: " ")) { continue }
                       let hint: LinkHint? = (title == nil && poster == nil) ? nil : LinkHint(title: title, poster: poster)
                       enqueue(l.url, depth: depth + 1, hint: hint)
                   }
@@ -7277,9 +7607,13 @@ jobs:
               @State private var showHelp = false
               @State private var showConsole = false
               @State private var showFebBoxSignIn = false
+              @State private var pendingDelete: IndexSet?
               @State private var febboxSignedIn: Bool?
               @State private var maxPages = 500
               @AppStorage("compressQuality") private var compressQuality = "1080"
+              /// Hidden while FebBox plays its preview stream (nothing is downloaded). Console: setSetting("showCompressSettings", true)
+              @AppStorage("showCompressSettings") private var showCompressSettings = false
+              private var downloading: Bool { showCompressSettings || !(Rules.load().resolved.febboxSharePlay ?? true) }
 
               var body: some View {
                   NavigationStack {
@@ -7303,7 +7637,7 @@ jobs:
                                           .disabled(store.isScanning)
                                   }
                               }
-                              .onDelete { store.removeSites(at: $0) }
+                              .onDelete { pendingDelete = $0 }
                           } header: {
                               Text("Your Websites")
                           } footer: {
@@ -7352,14 +7686,16 @@ jobs:
                                       Task { await FebBoxAccount.signOut(); febboxSignedIn = await FebBoxAccount.isSignedIn() }
                                   } label: { Label("Sign Out of FebBox", systemImage: "rectangle.portrait.and.arrow.right") }
                               }
-                              Picker("Compress to", selection: $compressQuality) {
-                                  Text("1080p (smaller, faster)").tag("1080")
-                                  Text("Original resolution").tag("original")
+                              if downloading {
+                                  Picker("Compress to", selection: $compressQuality) {
+                                      Text("1080p (smaller, faster)").tag("1080")
+                                      Text("Original resolution").tag("original")
+                                  }
                               }
                           } header: {
                               Text("Playing from FebBox")
                           } footer: {
-                              Text("Sign in once and CineScout plays FebBox's own preview stream straight from each movie's share page. Nothing is downloaded or added to your FebBox. If a movie has no preview, it's downloaded, compressed, played, then deleted when you close the player.")
+                              Text("Sign in once and CineScout plays FebBox's own preview stream straight from each movie's share page. Nothing is downloaded or added to your FebBox.")
                           }
 
                           Section {
@@ -7380,6 +7716,15 @@ jobs:
                           }
                       }
                       .task { febboxSignedIn = await FebBoxAccount.isSignedIn() }
+                      .confirmationDialog("Remove this website?", isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } }), titleVisibility: .visible) {
+                          Button("Remove Website and Its Movies", role: .destructive) {
+                              if let i = pendingDelete { store.removeSites(at: i) }
+                              pendingDelete = nil
+                          }
+                          Button("Cancel", role: .cancel) { pendingDelete = nil }
+                      } message: {
+                          Text("Its movies disappear from CineScout. You can add it back any time.")
+                      }
                       .sheet(isPresented: $showFebBoxSignIn) {
                           FebBoxSignInView { Task { febboxSignedIn = await FebBoxAccount.isSignedIn() } }
                       }
@@ -7423,6 +7768,133 @@ jobs:
                   let a = address
                   address = ""
                   store.addSite(a)
+              }
+          }
+          CINESCOUT_EOF
+
+          # ---- SiteSearch.swift
+          cat > 'CineScout/Sources/SiteSearch.swift' <<'CINESCOUT_EOF'
+          import Foundation
+          import SwiftSoup
+
+          /// Loose title matching: "polar expres" finds "The Polar Express (2004)", one typo allowed per word.
+          enum Fuzzy {
+              private static let stop: Set<String> = ["the", "a", "an", "of", "and", "&"]
+
+              static func tokens(_ s: String) -> [String] {
+                  let folded = s.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+                  let all = folded.components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty }
+                  let meaningful = all.filter { !stop.contains($0) }
+                  return meaningful.isEmpty ? all : meaningful
+              }
+
+              static func matches(_ query: String, _ text: String) -> Bool {
+                  let q = tokens(query), t = tokens(text)
+                  guard !q.isEmpty, !t.isEmpty else { return false }
+                  return q.allSatisfy { qt in
+                      t.contains { tt in
+                          if tt.hasPrefix(qt) { return true }
+                          guard qt.count >= 4 else { return false }
+                          return distance(qt, tt) <= 1 || distance(qt, String(tt.prefix(qt.count))) <= 1
+                      }
+                  }
+              }
+
+              /// Levenshtein distance (words are short, so this is cheap).
+              static func distance(_ a: String, _ b: String) -> Int {
+                  let a = Array(a), b = Array(b)
+                  if a.isEmpty { return b.count }
+                  if b.isEmpty { return a.count }
+                  var prev = Array(0...b.count)
+                  for i in 1...a.count {
+                      var cur = [i] + Array(repeating: 0, count: b.count)
+                      for j in 1...b.count {
+                          cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1))
+                      }
+                      prev = cur
+                  }
+                  return prev[b.count]
+              }
+          }
+
+          /// Finds each website's own search page (e.g. showbox.media/search?keyword=…) and remembers it.
+          enum SiteSearch {
+              private static let key = "siteSearchTemplates"
+
+              /// A URL with "{q}" where the search words go.
+              static func template(for site: URL) async -> String? {
+                  let siteKey = site.absoluteString
+                  if let saved = (UserDefaults.standard.dictionary(forKey: key) as? [String: String])?[siteKey] {
+                      return saved.isEmpty ? nil : saved
+                  }
+                  let found = await discover(site)
+                  var all = (UserDefaults.standard.dictionary(forKey: key) as? [String: String]) ?? [:]
+                  all[siteKey] = found ?? ""
+                  UserDefaults.standard.set(all, forKey: key)
+                  DiagLog.shared.log("search", found.map { "Search page for \(site.host ?? siteKey): \($0)" } ?? "No search page found on \(site.host ?? siteKey); searching its pages instead.")
+                  return found
+              }
+
+              static func url(for site: URL, query: String) async -> URL? {
+                  guard let t = await template(for: site) else { return nil }
+                  let q = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed.subtracting(CharacterSet(charactersIn: "&=+?#"))) ?? query
+                  return URL(string: t.replacingOccurrences(of: "{q}", with: q))
+              }
+
+              static func forget() { UserDefaults.standard.removeObject(forKey: key) }
+
+              private static func fetch(_ url: URL) async -> (Int, String)? {
+                  var req = URLRequest(url: url, timeoutInterval: 15)
+                  req.setValue(Scraper.userAgent, forHTTPHeaderField: "User-Agent")
+                  guard let (data, resp) = try? await URLSession.shared.data(for: req) else { return nil }
+                  let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                  return (code, String(decoding: data, as: UTF8.self))
+              }
+
+              private static func discover(_ site: URL) async -> String? {
+                  guard let origin = URL(string: "/", relativeTo: site)?.absoluteURL else { return nil }
+                  // 1) The site's own search box.
+                  for page in [site, origin] {
+                      guard let (code, html) = await fetch(page), code < 400, let doc = try? SwiftSoup.parse(html, page.absoluteString) else { continue }
+                      let forms = (try? doc.select("form").array()) ?? []
+                      let ranked = forms.sorted { score($0) > score($1) }
+                      for form in ranked where score(form) > 0 {
+                          guard let input = try? form.select("input[type=search], input[type=text], input:not([type])").first(),
+                                let name = try? input.attr("name"), !name.isEmpty else { continue }
+                          let method = ((try? form.attr("method")) ?? "get").lowercased()
+                          guard method != "post" else { continue }
+                          let action = (try? form.attr("action")) ?? ""
+                          guard let base = URL(string: action.isEmpty ? page.absoluteString : action, relativeTo: page)?.absoluteURL,
+                                var c = URLComponents(url: base, resolvingAgainstBaseURL: true) else { continue }
+                          var items = (c.queryItems ?? []).filter { $0.name != name }
+                          // Hidden fields the form always sends (e.g. type=movie).
+                          for h in (try? form.select("input[type=hidden]").array()) ?? [] {
+                              if let n = try? h.attr("name"), !n.isEmpty { items.append(URLQueryItem(name: n, value: (try? h.attr("value")) ?? "")) }
+                          }
+                          items.append(URLQueryItem(name: name, value: "QQQ"))
+                          c.queryItems = items
+                          if let s = c.url?.absoluteString { return s.replacingOccurrences(of: "QQQ", with: "{q}") }
+                      }
+                  }
+                  // 2) Common search addresses.
+                  for path in ["/search?keyword={q}", "/search?q={q}", "/?s={q}", "/search/{q}", "/search?query={q}"] {
+                      guard let probe = URL(string: path.replacingOccurrences(of: "{q}", with: "the"), relativeTo: origin)?.absoluteURL,
+                            let (code, html) = await fetch(probe), code < 400, html.count > 2000 else { continue }
+                      var root = origin.absoluteString
+                      while root.hasSuffix("/") { root.removeLast() }
+                      return root + path
+                  }
+                  return nil
+              }
+
+              private static func score(_ form: Element) -> Int {
+                  let blob = ((try? form.outerHtml()) ?? "").lowercased()
+                  if blob.contains("password") { return 0 }
+                  var s = 0
+                  if blob.contains("search") { s += 3 }
+                  if blob.contains("type=\"search\"") { s += 2 }
+                  for n in ["name=\"q\"", "name=\"s\"", "name=\"keyword\"", "name=\"query\"", "name=\"search\"", "name=\"k\""] where blob.contains(n) { s += 2 }
+                  return s
               }
           }
           CINESCOUT_EOF
