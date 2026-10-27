@@ -4081,6 +4081,7 @@ jobs:
               private var sinceSave = 0
               private var reloads = 0
               private var lastFileProbe = -100
+              private var openedFolder: String?
               private var desktop = false
               static let desktopUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
               private var probes = 0
@@ -4138,7 +4139,8 @@ jobs:
               func run(page: URL?, share knownShare: URL?, title: String? = nil, stopAtShare: Bool = false) async -> Result {
                   self.stopAtShare = stopAtShare
                   if let title {
-                      let clean = Scraper.cleanTitle(stem: title, dotsAreSpaces: false).0
+                      let site = (page ?? knownShare)?.host.map(Scraper.baseDomain)
+                      let clean = Self.movieName(title, site: site)
                       if clean.count > 2 { names.append(clean) }
                   }
                   if let knownShare {
@@ -4158,7 +4160,8 @@ jobs:
                   // Accept, Accept, Save, Movies, the folder and the preview take a while: allow at least 2 minutes.
                   await drive(seconds: stopAtShare ? (rules.robotTimeout ?? 60) : max(rules.robotTimeout ?? 60, 120))
 
-                  var result = Result(share: share, videos: videos, names: names + fileNames, needsSignIn: needsSignIn)
+                  // For removal afterwards: exactly the folder that was opened, never a guess.
+                  var result = Result(share: share, videos: videos, names: openedFolder.map { [$0] } ?? names, needsSignIn: needsSignIn)
                   if let v = videos.first {
                       let all = await webView.configuration.websiteDataStore.httpCookieStore.allCookies()
                       let host = v.host?.lowercased() ?? ""
@@ -4401,7 +4404,7 @@ jobs:
                         const f = CS.clickIn(dlg, folderRe, clicked, 40);
                         if (f) return JSON.stringify({ clicked: f, kind: 'pickFolder' });
                       }
-                      const sv = CS.clickIn(dlg, saveRe, clicked, 12);
+                      const sv = saveState < 2 ? CS.clickIn(dlg, saveRe, clicked, 12) : null;
                       if (sv) return JSON.stringify({ clicked: sv, kind: 'save' });
                       return JSON.stringify({ present: false, dialog: true });
                     }
@@ -4486,7 +4489,10 @@ jobs:
                           sinceSave = 0
                           // Remember exactly which folder we opened, so the same one is removed afterwards.
                           let opened = label(c)
-                          if opened.count > 2 && !names.contains(opened) { names.insert(opened, at: 0) }
+                          if opened.count > 2 {
+                              openedFolder = opened
+                              if !names.contains(opened) { names.insert(opened, at: 0) }
+                          }
                           DiagLog.shared.log("robot", "Opened “\(opened)”.")
                           say("Opening “\(opened)”…")
                       case "file":
@@ -4543,6 +4549,9 @@ jobs:
                         const t = CS.text(b);
                         if (t && t.length < 40 && removeRe.test(t)) { const sig = CS.clickElement(b, clicked); if (sig) return JSON.stringify({ clicked: sig, kind: 'remove', present: true }); }
                       }
+                      // FebBox's ••• is a picture (img.file_more_btn) with no text.
+                      const mb = anc.querySelector('.file_more_btn, [class*=more_btn], [class*=more-btn], [class*=file_more]');
+                      if (mb && CS.visible(mb)) { const sig = CS.clickElement(mb, clicked); if (sig) return JSON.stringify({ clicked: sig, kind: 'more', present: true }); }
                       for (const b of btns) {
                         if (!CS.visible(b)) continue;
                         const t = CS.text(b);
@@ -4742,7 +4751,41 @@ jobs:
                       return 2
                   }
                   fileNames.sort { rank($0) < rank($1) }
-                  if let t = out["title"] as? String, t.count > 2, t.count < 150, !names.contains(t), !Self.looksLikeFile(t) { names.append(t) }
+                  // The movie's name as the files spell it: Polar.Express.2004.2160p.mkv → "Polar Express".
+                  for f in fileNames {
+                      let stem = (f as NSString).deletingPathExtension
+                      let n = Scraper.cleanTitle(stem: stem, dotsAreSpaces: true).0
+                      if n.count > 2, !names.contains(n) { names.append(n) }
+                  }
+                  // The page's own title only if it's clearly the same movie (never a user name or a site name).
+                  if let t = out["title"] as? String, t.count > 2, t.count < 150, !Self.looksLikeFile(t) {
+                      let clean = Self.movieName(t, site: nil)
+                      if !names.contains(clean), Self.sharesWord(clean, names) { names.append(clean) }
+                  }
+              }
+
+              /// "The Polar Express - ShowBox" → "The Polar Express" (drops the site's name after a dash or bar).
+              static func movieName(_ raw: String, site: String?) -> String {
+                  var t = raw.trimmingCharacters(in: .whitespaces)
+                  let siteWord = site?.components(separatedBy: ".").first?.lowercased() ?? ""
+                  let generic = ["showbox", "febbox", "watch", "stream", "streaming", "movies", "movie", "online", "free", "hd", "download"]
+                  while let r = t.range(of: #"\s+[-|–—·:]\s+([^-|–—·]{2,40})$"#, options: .regularExpression) {
+                      let tail = t[r].trimmingCharacters(in: CharacterSet(charactersIn: " -|–—·:")).lowercased()
+                      let words = tail.components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty }
+                      let isSite = (!siteWord.isEmpty && tail.replacingOccurrences(of: " ", with: "").contains(siteWord))
+                          || tail.contains(".") || (!words.isEmpty && words.allSatisfy { generic.contains($0) })
+                      guard isSite else { break }
+                      t = String(t[..<r.lowerBound])
+                  }
+                  return t
+              }
+
+              private static func sharesWord(_ s: String, _ others: [String]) -> Bool {
+                  func words(_ x: String) -> Set<String> {
+                      Set(x.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted).filter { $0.count >= 4 })
+                  }
+                  let mine = words(s)
+                  return others.contains { !words($0).isDisjoint(with: mine) }
               }
 
               private static func looksLikeFile(_ s: String) -> Bool {
@@ -4750,7 +4793,8 @@ jobs:
               }
 
               private func label(_ sig: String) -> String {
-                  String((sig.components(separatedBy: "|").first ?? sig).prefix(40))
+                  let s = sig.hasPrefix("in|") ? String(sig.dropFirst(3)) : sig
+                  return String((s.components(separatedBy: "|").first ?? s).prefix(40))
               }
 
               /// Saves the current page for the diagnostic report, so Claude can see the real buttons.
