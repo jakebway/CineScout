@@ -4081,6 +4081,8 @@ jobs:
               private var sinceSave = 0
               private var reloads = 0
               private var lastFileProbe = -100
+              private var desktop = false
+              static let desktopUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
               private var probes = 0
               private var removeClicked = false
               private var goneCount = 0
@@ -4153,7 +4155,8 @@ jobs:
                       return Result()
                   }
                   DiagLog.shared.log("robot", "Start: \(knownShare?.absoluteString ?? page?.absoluteString ?? "")")
-                  await drive(seconds: rules.robotTimeout ?? 60)
+                  // Accept, Accept, Save, Movies, the folder and the preview take a while: allow at least 2 minutes.
+                  await drive(seconds: stopAtShare ? (rules.robotTimeout ?? 60) : max(rules.robotTimeout ?? 60, 120))
 
                   var result = Result(share: share, videos: videos, names: names + fileNames, needsSignIn: needsSignIn)
                   if let v = videos.first {
@@ -4179,7 +4182,8 @@ jobs:
                   fileNames = []
                   guard !names.isEmpty, let console = URL(string: rules.febboxConsoleURL ?? "") else { return false }
                   enter(.remove)
-                  say("Removing it from Shared…")
+                  say("Removing it from Movies…")
+                  useDesktopSite()
                   DiagLog.shared.log("robot", "Remove from collaborative files: \(names.prefix(3).joined(separator: " | "))")
                   webView.load(URLRequest(url: console))
                   await drive(seconds: 75)
@@ -4411,7 +4415,10 @@ jobs:
                     // 3. Inside the movie's folder: tap the video file (best quality first).
                     for (let i = 0; i < files.length; i++) {
                       const f = CS.findName([files[i]]);
-                      if (f) { const s = CS.clickElement(f, clicked); if (s) return JSON.stringify({ clicked: s, kind: 'file', present: true }); }
+                      if (!f) continue;
+                      const th = CS.thumb(f);   // the poster/play button opens the preview
+                      if (th) { const s = CS.clickElement(th, clicked); if (s) return JSON.stringify({ clicked: s, kind: 'file', present: true }); }
+                      const s = CS.clickElement(f, clicked); if (s) return JSON.stringify({ clicked: s, kind: 'file', present: true });
                     }
                     // 4. The movie's folder (in Movies, or in Shared).
                     const item = CS.findName(names);
@@ -4428,6 +4435,8 @@ jobs:
                       if (fl) return JSON.stringify({ clicked: fl, kind: 'files', present: false });
                       const s = CS.clickText(new RegExp(collabSrc, 'i'), clicked, 40);
                       if (s) return JSON.stringify({ clicked: s, kind: 'section', present: false });
+                      // Folders further down load as you scroll.
+                      if (CS.scrollMore()) return JSON.stringify({ kind: 'scroll', present: false });
                     }
                     return JSON.stringify({ present: !!item });
                   })(\(js(rules.febboxAcceptPattern)), \(rules.febboxAutoAccept ?? true), \(js(playConfirm)), \(js(rules.febboxCollabPattern)), \(js(rules.febboxPreviewPattern)), \(saveFolderJSON), \(js(rules.febboxSavePattern)), \(js(rules.febboxFilesPattern)), \(namesJSON), \(fileNamesJSON), \(clickedJSON), \(consoleAcceptJSON), \(saveState), \(probes - lastFileProbe < 7))
@@ -4458,6 +4467,15 @@ jobs:
                           clicked.removeAll()
                           DiagLog.shared.log("robot", "Tapped Save.")
                           say("Saved. Opening \(rules.febboxSaveFolder ?? "the folder")…")
+                          if rules.febboxDesktopPreview ?? true, let console = URL(string: rules.febboxConsoleURL ?? "") {
+                              // Give FebBox a moment to save, then reopen the console as the desktop site.
+                              Task { [weak self] in
+                                  try? await Task.sleep(nanoseconds: 1_500_000_000)
+                                  guard let self, !self.finished else { return }
+                                  self.useDesktopSite()
+                                  self.webView.load(URLRequest(url: console))
+                              }
+                          }
                       case "folder":
                           sinceSave = 0
                           DiagLog.shared.log("robot", "Opened “\(label(c))”.")
@@ -4478,6 +4496,8 @@ jobs:
                       case "preview": say("Starting FebBox's preview…")
                       default: break
                       }
+                  } else if kind == "scroll" {
+                      sinceSave = 0
                   } else if saveState == 2 {
                       // Saved, but nothing to tap here: start again from the console's Files page (once or twice).
                       sinceSave += 1
@@ -4510,7 +4530,9 @@ jobs:
                       const fl = CS.clickText(new RegExp(filesSrc, 'i'), clicked, 20);
                       if (fl) return JSON.stringify({ clicked: fl, kind: 'files', present: false });
                       const s = CS.clickText(new RegExp(collabSrc, 'i'), clicked, 40);
-                      return JSON.stringify(s ? { clicked: s, kind: 'section', present: false } : { present: false });
+                      if (s) return JSON.stringify({ clicked: s, kind: 'section', present: false });
+                      CS.scrollMore();
+                      return JSON.stringify({ present: false });
                     }
                     // A remove button or "more" menu next to the item
                     let anc = row;
@@ -4619,6 +4641,26 @@ jobs:
                   });
                   return out;
                 },
+                thumb: function (el) {
+                  var a = el;
+                  for (var k = 0; k < 5 && a && a.parentElement; k++) {
+                    a = a.parentElement;
+                    if (CS.extRe.test(CS.text(a)) && (CS.text(a).match(new RegExp(CS.extRe.source, 'gi')) || []).length > 1) return null;
+                    var img = a.querySelector('img, video, [class*=play], [class*=cover], [class*=thumb], [class*=poster]');
+                    if (img && img !== el && !el.contains(img) && CS.visible(img)) return img;
+                  }
+                  return null;
+                },
+                scrollMore: function () {
+                  var moved = false, h = window.innerHeight || 800;
+                  var before = window.scrollY; window.scrollBy(0, h * 0.8); if (window.scrollY !== before) moved = true;
+                  Array.from(document.querySelectorAll('div, main, section, ul')).forEach(function (d) {
+                    if (d.scrollHeight > d.clientHeight + 40 && /(auto|scroll)/.test(getComputedStyle(d).overflowY)) {
+                      var b = d.scrollTop; d.scrollTop = b + d.clientHeight * 0.8; if (d.scrollTop !== b) moved = true;
+                    }
+                  });
+                  return moved;
+                },
                 esc: function (s) { return (s || '').replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&'); },
                 dialog: function (headRe, buttonRe) {
                   var els = Array.from(document.querySelectorAll('h1, h2, h3, h4, h5, h6, header, strong, b, div, span, p, label')).reverse();
@@ -4648,6 +4690,11 @@ jobs:
                 findName: function (names) {
                   var wanted = names.map(CS.norm).filter(function (n) { return n.length > 2; });
                   var els = CS.all();
+                  // An exact name first (Polar.Express.2004.2160p.mkv), then anything that starts with it.
+                  for (var x = 0; x < els.length; x++) {
+                    var e = els[x]; if (e.children.length > 3 || !CS.visible(e)) continue;
+                    if (wanted.indexOf(CS.norm(CS.text(e))) >= 0) return e;
+                  }
                   for (var i = 0; i < els.length; i++) {
                     var el = els[i]; if (el.children.length > 3 || !CS.visible(el)) continue;
                     var raw = CS.text(el); if (!raw || raw.length > 220) continue;
@@ -4803,13 +4850,24 @@ jobs:
 
               // MARK: Hidden placement (pages need to be on screen for their scripts to run normally)
 
+              /// FebBox's file previews work on its desktop site: look like a Mac with a big screen from here on.
+              private func useDesktopSite() {
+                  guard !desktop, rules.febboxDesktopPreview ?? true else { return }
+                  desktop = true
+                  webView.customUserAgent = Self.desktopUserAgent
+                  let big = CGRect(x: 0, y: 0, width: 1280, height: 900)
+                  webView.frame = big
+                  holder?.frame = big
+                  DiagLog.shared.log("robot", "Switched to FebBox's desktop site.")
+              }
+
               private func attachOffscreen() {
                   guard holder == nil,
                         let window = UIApplication.shared.connectedScenes
                           .compactMap({ $0 as? UIWindowScene })
                           .flatMap(\.windows)
                           .first(where: \.isKeyWindow) else { return }
-                  let box = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+                  let box = UIView(frame: webView.frame)
                   box.alpha = 0.01
                   box.isUserInteractionEnabled = false
                   box.addSubview(webView)
@@ -4960,9 +5018,11 @@ jobs:
               var febboxSavePattern: String?
               /// The console's link to your files, used to get back to the save folder.
               var febboxFilesPattern: String?
+              /// Use FebBox's desktop site in the console (its file previews only play there).
+              var febboxDesktopPreview: Bool?
 
               static let defaults = Rules(
-                  version: 13,
+                  version: 14,
                   note: "CineScout scanner rules. Claude can send you a new version of this file: paste it in Diagnostics → Scanner rules, save, then rescan. Optional `script` is JavaScript defining extract(html, url) that returns {title, year, overview, poster, videos: [], playLinks: [], links: [], isMovie}; call log(text) to write to the diagnostic log.",
                   playLabelPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:play|watch|stream|view online|start watching|resume|download|direct link|mirror|server)\b|\b(?:2160p|1080p|720p|480p|4k|full movie)\b|^\s*[▶►⏵]"#,
                   genericLabelPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:play|play now|watch|watch now|watch online|watch movie|watch free|stream|stream now|view|download|download now|direct link|link|here|click here|more|more info|info|details|trailer|open|start|resume|next|previous|prev|back|home|menu|login|log in|sign in|register|search|parent directory|\.\./?|name|last modified|size|description|(?:server|mirror|source|part|episode|ep|season|page)\s*#?\d*|\d{3,4}p|4k|uhd|hd|sd|mp4|mkv|m3u8|open in \S+(?: app)?|»|«|›|‹|\d{1,2})\s*$"#,
@@ -5012,7 +5072,8 @@ jobs:
                   febboxBlockRedirects: true,
                   febboxSaveFolder: "Movies",
                   febboxSavePattern: #"(?i)^\s*(?:save|save here|confirm|ok)\s*$"#,
-                  febboxFilesPattern: #"(?i)^\s*(?:files|my files|all files)\s*$"#
+                  febboxFilesPattern: #"(?i)^\s*(?:files|my files|all files)\s*$"#,
+                  febboxDesktopPreview: true
               )
 
               /// These rules with built-in defaults filled in for anything missing.
@@ -5058,7 +5119,8 @@ jobs:
                       febboxBlockRedirects: febboxBlockRedirects ?? d.febboxBlockRedirects,
                       febboxSaveFolder: febboxSaveFolder ?? d.febboxSaveFolder,
                       febboxSavePattern: febboxSavePattern ?? d.febboxSavePattern,
-                      febboxFilesPattern: febboxFilesPattern ?? d.febboxFilesPattern
+                      febboxFilesPattern: febboxFilesPattern ?? d.febboxFilesPattern,
+                      febboxDesktopPreview: febboxDesktopPreview ?? d.febboxDesktopPreview
                   )
               }
 
@@ -7275,6 +7337,16 @@ jobs:
                   webView.load(URLRequest(url: url))
               }
 
+              @Published private(set) var desktop = false
+
+              /// FebBox's file previews play on its desktop site.
+              func toggleDesktop() {
+                  desktop.toggle()
+                  webView.customUserAgent = desktop ? BrowserRobot.desktopUserAgent : nil
+                  freeBrowsingUntil = Date().addingTimeInterval(600)
+                  webView.reload()
+              }
+
               func received(_ raw: String) {
                   guard let url = URL(string: raw), !captured.contains(url) else { return }
                   captured.insert(url, at: 0)
@@ -7500,6 +7572,9 @@ jobs:
                                       }
                                   } label: { Label("Sign In to \(session.link.service)", systemImage: "person.crop.circle") }
                                   Button { model.webView.reload() } label: { Label("Reload", systemImage: "arrow.clockwise") }
+                                  Button { model.toggleDesktop() } label: {
+                                      Label(model.desktop ? "Phone Site" : "Desktop Site (for previews)", systemImage: model.desktop ? "iphone" : "desktopcomputer")
+                                  }
                                   Button { openURL(session.link.url) } label: {
                                       Label("Open in \(session.link.service) App or Safari", systemImage: "arrow.up.forward.app")
                                   }
