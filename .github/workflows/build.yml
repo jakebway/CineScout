@@ -2210,6 +2210,15 @@ jobs:
                       movies = saved.movies
                       sites = saved.sites
                   }
+                  // Only things worth watching: drop ads and junk an older scan let in, and tidy "Title - SiteName".
+                  let rules = Rules.load()
+                  let before = movies.count
+                  movies.removeAll { Scraper.notAMovie($0, rules: rules) }
+                  for i in movies.indices {
+                      let clean = Scraper.stripSiteName(movies[i].title, host: movies[i].pageURL?.host)
+                      if clean != movies[i].title { movies[i].title = clean }
+                  }
+                  if movies.count != before { DiagLog.shared.log("library", "Removed \(before - movies.count) ad/junk item(s).") }
                   if let data = try? Data(contentsOf: progressURL),
                      let p = try? JSONDecoder().decode([String: WatchProgress].self, from: data) {
                       progress = p
@@ -4877,18 +4886,7 @@ jobs:
 
               /// "The Polar Express - ShowBox" → "The Polar Express" (drops the site's name after a dash or bar).
               static func movieName(_ raw: String, site: String?) -> String {
-                  var t = raw.trimmingCharacters(in: .whitespaces)
-                  let siteWord = site?.components(separatedBy: ".").first?.lowercased() ?? ""
-                  let generic = ["showbox", "febbox", "watch", "stream", "streaming", "movies", "movie", "online", "free", "hd", "download"]
-                  while let r = t.range(of: #"\s+[-|–—·:]\s+([^-|–—·]{2,40})$"#, options: .regularExpression) {
-                      let tail = t[r].trimmingCharacters(in: CharacterSet(charactersIn: " -|–—·:")).lowercased()
-                      let words = tail.components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty }
-                      let isSite = (!siteWord.isEmpty && tail.replacingOccurrences(of: " ", with: "").contains(siteWord))
-                          || tail.contains(".") || (!words.isEmpty && words.allSatisfy { generic.contains($0) })
-                      guard isSite else { break }
-                      t = String(t[..<r.lowerBound])
-                  }
-                  return t
+                  Scraper.stripSiteName(raw, host: site)
               }
 
               private static func sharesWord(_ s: String, _ others: [String]) -> Bool {
@@ -5180,9 +5178,13 @@ jobs:
               var febboxDesktopPreview: Bool?
               /// Play straight from the share page's desktop preview (tap the file, tap ▶). No Accept, nothing saved.
               var febboxSharePlay: Bool?
+              /// Pages that aren't worth watching (ads, apps, help pages…), by address and by title. Movies, shows,
+              /// episodes, documentaries, musicals and other media are all kept.
+              var notMovieURLPattern: String?
+              var notMovieTitlePattern: String?
 
               static let defaults = Rules(
-                  version: 15,
+                  version: 17,
                   note: "CineScout scanner rules. Claude can send you a new version of this file: paste it in Diagnostics → Scanner rules, save, then rescan. Optional `script` is JavaScript defining extract(html, url) that returns {title, year, overview, poster, videos: [], playLinks: [], links: [], isMovie}; call log(text) to write to the diagnostic log.",
                   playLabelPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:play|watch|stream|view online|start watching|resume|download|direct link|mirror|server)\b|\b(?:2160p|1080p|720p|480p|4k|full movie)\b|^\s*[▶►⏵]"#,
                   genericLabelPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:play|play now|watch|watch now|watch online|watch movie|watch free|stream|stream now|view|download|download now|direct link|link|here|click here|more|more info|info|details|trailer|open|start|resume|next|previous|prev|back|home|menu|login|log in|sign in|register|search|parent directory|\.\./?|name|last modified|size|description|(?:server|mirror|source|part|episode|ep|season|page)\s*#?\d*|\d{3,4}p|4k|uhd|hd|sd|mp4|mkv|m3u8|open in \S+(?: app)?|»|«|›|‹|\d{1,2})\s*$"#,
@@ -5234,7 +5236,9 @@ jobs:
                   febboxSavePattern: #"(?i)^\s*(?:save|save here|confirm|ok)\s*$"#,
                   febboxFilesPattern: #"(?i)^\s*(?:files|my files|all files)\s*$"#,
                   febboxDesktopPreview: true,
-                  febboxSharePlay: true
+                  febboxSharePlay: true,
+                  notMovieURLPattern: #"(?i)/(?:ads?|adverts?|advertis\w*|sponsor\w*|promo\w*|banners?|affiliates?|partners?|redirect|out|go|click|track\w*|vpn|casino|bet\w*|download|downloads|apps?|app-download|about|faq|help|contact|login|register|signup|account|privacy|terms|dmca|blog|news|tags?|genres?|category|categories|country|search|actors?|person|people|cast|donate|premium|vip|subscribe|pricing)(?:[/?#]|$)|doubleclick|googlesyndication|adservice|popads|propeller"#,
+                  notMovieTitlePattern: #"(?i)^\s*(?:(?:android|ios|iphone|ipad|windows|mac|tv)\s+app|apps?|download(?:\s+(?:the\s+)?app)?|get the app|install.*|home|faq|help|contact(?: us)?|about(?: us)?|log ?in|sign ?in|register|sign ?up|dmca|privacy(?: policy)?|terms.*|untitled|advertisement|sponsored|ad|ads|promo.*|donate|go premium|get vip.*|subscribe.*|join (?:our|us).*)\s*$|\b(?:vpn|online casino|sports ?betting|telegram channel|discord server|click here|limited offer|\d+% off)\b"#
               )
 
               /// These rules with built-in defaults filled in for anything missing.
@@ -5282,7 +5286,9 @@ jobs:
                       febboxSavePattern: febboxSavePattern ?? d.febboxSavePattern,
                       febboxFilesPattern: febboxFilesPattern ?? d.febboxFilesPattern,
                       febboxDesktopPreview: febboxDesktopPreview ?? d.febboxDesktopPreview,
-                      febboxSharePlay: febboxSharePlay ?? d.febboxSharePlay
+                      febboxSharePlay: febboxSharePlay ?? d.febboxSharePlay,
+                      notMovieURLPattern: notMovieURLPattern ?? d.notMovieURLPattern,
+                      notMovieTitlePattern: notMovieTitlePattern ?? d.notMovieTitlePattern
                   )
               }
 
@@ -5647,7 +5653,7 @@ jobs:
                   }
 
                   await progress(ScanProgress(pages: pages, found: foundCount, status: "Reading metadata files…"))
-                  let movies = await finalize()
+                  let movies = onlyMovies(await finalize())
                   writeSamples()
                   let secs = String(format: "%.1f", Date().timeIntervalSince(started))
                   let waiting = movies.filter(\.needsLookup).count
@@ -6447,7 +6453,7 @@ jobs:
                   let candidates: [String?] = [js?.title, ruleTitle, Self.str(ld?["name"]), meta["og:title"], meta["twitter:title"],
                                                hinted?.0, try? doc.select("h1").first()?.text(), Self.trimSiteSuffix(titleText)]
                   var title = candidates
-                      .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                      .compactMap { $0.map { Self.stripSiteName($0, host: pageURL.host) }?.trimmingCharacters(in: .whitespacesAndNewlines) }
                       .first { !$0.isEmpty }
                       ?? videos.first.map { Self.cleanTitle(stem: ($0.lastPathComponent as NSString).deletingPathExtension).0 }
                       ?? "Untitled"
@@ -7008,6 +7014,57 @@ jobs:
                   return (name.isEmpty ? raw : name, year)
               }
 
+              /// "The Polar Express - ShowBox" → "The Polar Express": drops the site's own name after a dash or bar,
+              /// but keeps real subtitles ("Mission: Impossible - Dead Reckoning").
+              static func stripSiteName(_ raw: String, host: String?) -> String {
+                  var t = raw.trimmingCharacters(in: .whitespaces)
+                  let siteWord = host.map(baseDomain)?.components(separatedBy: ".").first?.lowercased() ?? ""
+                  let generic: Set<String> = ["showbox", "febbox", "watch", "stream", "streaming", "movies", "movie", "online", "free", "hd", "download", "full"]
+                  while let r = t.range(of: #"\s+[-|–—·:]\s+([^-|–—·]{2,40})$"#, options: .regularExpression) {
+                      let tail = t[r].trimmingCharacters(in: CharacterSet(charactersIn: " -|–—·:")).lowercased()
+                      let words = tail.components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty }
+                      let isSite = (!siteWord.isEmpty && tail.replacingOccurrences(of: " ", with: "").contains(siteWord))
+                          || tail.contains(".") || (!words.isEmpty && words.allSatisfy { generic.contains($0) })
+                      guard isSite else { break }
+                      t = String(t[..<r.lowerBound])
+                  }
+                  return t.isEmpty ? raw : t
+              }
+
+              /// True for things not worth watching: ads, apps, help pages. Shows, episodes and all other media are kept.
+              static func notAMovie(_ m: Movie, rules: Rules) -> Bool {
+                  let r = rules.resolved
+                  if let u = m.pageURL?.absoluteString, let re = regex(r.notMovieURLPattern, name: "notMovieURLPattern"), matches(re, u) { return true }
+                  if let re = regex(r.notMovieTitlePattern, name: "notMovieTitlePattern"), matches(re, m.title) { return true }
+                  return false
+              }
+
+              /// Keeps only media worth watching (movies, shows, documentaries, musicals…); drops ads and junk.
+              private func onlyMovies(_ all: [Movie]) -> [Movie] {
+                  var kept = all.filter { m in
+                      if Self.notAMovie(m, rules: rules) {
+                          log.log("scan", "Skipped “\(m.title)” (ad or not something to watch)")
+                          return false
+                      }
+                      return true
+                  }
+                  func firstSegment(_ u: URL) -> String { u.pathComponents.dropFirst().first?.lowercased() ?? "" }
+                  // Site layout: media lives in a few folders (/movie/, /tv/…). A lone page in some other folder
+                  // (like /download) is junk, not something to watch.
+                  let byHost = Dictionary(grouping: kept.compactMap(\.pageURL), by: { $0.host?.lowercased() ?? "" })
+                  for (host, urls) in byHost where urls.count >= 20 {
+                      let counts = Dictionary(grouping: urls, by: firstSegment).mapValues(\.count)
+                      let rare = Set(counts.filter { $0.value <= 2 && Double($0.value) < Double(urls.count) * 0.02 }.keys)
+                      guard !rare.isEmpty else { continue }
+                      kept.removeAll { m in
+                          guard let u = m.pageURL, (u.host?.lowercased() ?? "") == host, rare.contains(firstSegment(u)) else { return false }
+                          log.log("scan", "Skipped “\(m.title)” (a lone page outside the site's movie and show folders)")
+                          return true
+                      }
+                  }
+                  return kept
+              }
+
               static func trimSiteSuffix(_ t: String) -> String {
                   for sep in [" | ", " – ", " — ", " - ", " · ", " :: "] {
                       if let r = t.range(of: sep) {
@@ -7219,6 +7276,8 @@ jobs:
               @State private var address = ""
               @State private var showHelp = false
               @State private var showConsole = false
+              @State private var showFebBoxSignIn = false
+              @State private var febboxSignedIn: Bool?
               @State private var maxPages = 500
               @AppStorage("compressQuality") private var compressQuality = "1080"
 
@@ -7276,6 +7335,23 @@ jobs:
                           }
 
                           Section {
+                              HStack {
+                                  Label("FebBox account", systemImage: "person.crop.circle")
+                                  Spacer()
+                                  switch febboxSignedIn {
+                                  case .some(true): Text("Signed in").foregroundStyle(.green)
+                                  case .some(false): Text("Not signed in").foregroundStyle(.orange)
+                                  case .none: ProgressView()
+                                  }
+                              }
+                              Button { showFebBoxSignIn = true } label: {
+                                  Label(febboxSignedIn == true ? "Sign In Again" : "Sign In to FebBox", systemImage: "key.fill")
+                              }
+                              if febboxSignedIn == true {
+                                  Button(role: .destructive) {
+                                      Task { await FebBoxAccount.signOut(); febboxSignedIn = await FebBoxAccount.isSignedIn() }
+                                  } label: { Label("Sign Out of FebBox", systemImage: "rectangle.portrait.and.arrow.right") }
+                              }
                               Picker("Compress to", selection: $compressQuality) {
                                   Text("1080p (smaller, faster)").tag("1080")
                                   Text("Original resolution").tag("original")
@@ -7283,7 +7359,7 @@ jobs:
                           } header: {
                               Text("Playing from FebBox")
                           } footer: {
-                              Text("FebBox videos are downloaded, compressed, played, then deleted as soon as you close the player. Nothing is kept on your iPhone or added to your FebBox. Streams that aren't single files play directly instead.")
+                              Text("Sign in once and CineScout plays FebBox's own preview stream straight from each movie's share page. Nothing is downloaded or added to your FebBox. If a movie has no preview, it's downloaded, compressed, played, then deleted when you close the player.")
                           }
 
                           Section {
@@ -7302,6 +7378,10 @@ jobs:
                           Section {
                               Text(AppInfo.summary).font(.footnote).foregroundStyle(.secondary)
                           }
+                      }
+                      .task { febboxSignedIn = await FebBoxAccount.isSignedIn() }
+                      .sheet(isPresented: $showFebBoxSignIn) {
+                          FebBoxSignInView { Task { febboxSignedIn = await FebBoxAccount.isSignedIn() } }
                       }
                       .navigationTitle("Settings")
                       .navigationBarTitleDisplayMode(.inline)
@@ -7813,6 +7893,69 @@ jobs:
                   .padding(.horizontal, 18)
                   .padding(.vertical, 8)
                   .background(.bar)
+              }
+          }
+
+          // MARK: Settings → Sign In to FebBox
+
+          /// Opens FebBox's sign-in page. You stay signed in afterwards (the hidden player uses the same sign-in).
+          struct FebBoxSignInView: View {
+              @Environment(\.dismiss) private var dismiss
+              @StateObject private var model = WebModel()
+              var onClose: () -> Void = {}
+
+              var body: some View {
+                  NavigationStack {
+                      VStack(spacing: 0) {
+                          HStack(alignment: .top, spacing: 10) {
+                              Image(systemName: "person.crop.circle.badge.checkmark").foregroundStyle(.orange)
+                              Text("Sign in to FebBox below. When you see your files, tap **Done**. You'll stay signed in.")
+                                  .font(.footnote).foregroundStyle(.white.opacity(0.85))
+                              Spacer(minLength: 0)
+                          }
+                          .padding(12)
+                          .background(Color(white: 0.12))
+                          if model.isLoading { ProgressView(value: model.progress).tint(.orange) }
+                          WebViewHost(model: model)
+                      }
+                      .background(Color.black)
+                      .navigationTitle("Sign In to FebBox")
+                      .navigationBarTitleDisplayMode(.inline)
+                      .toolbar {
+                          ToolbarItem(placement: .confirmationAction) { Button("Done") { onClose(); dismiss() } }
+                          ToolbarItem(placement: .primaryAction) {
+                              Button { model.webView.reload() } label: { Image(systemName: "arrow.clockwise") }
+                          }
+                      }
+                  }
+                  .preferredColorScheme(.dark)
+                  .onAppear {
+                      guard model.webView.url == nil,
+                            let login = URL(string: Rules.load().resolved.febboxLoginURL ?? "https://www.febbox.com/login") else { return }
+                      DiagLog.shared.log("web", "Opening the FebBox sign-in page from Settings.")
+                      model.loadForSignIn(login)
+                      model.notice = nil
+                  }
+              }
+          }
+
+          enum FebBoxAccount {
+              /// Signed in when FebBox has left its sign-in cookie in the shared web storage.
+              @MainActor static func isSignedIn() async -> Bool {
+                  let cookies = await WKWebsiteDataStore.default().httpCookieStore.allCookies()
+                  return cookies.contains { c in
+                      c.domain.lowercased().contains("febbox") && ["ui", "token", "user_token"].contains(c.name.lowercased()) && !c.value.isEmpty
+                          && (c.expiresDate.map { $0 > Date() } ?? true)
+                  }
+              }
+
+              /// Signs out by clearing FebBox's cookies.
+              @MainActor static func signOut() async {
+                  let store = WKWebsiteDataStore.default().httpCookieStore
+                  for c in await store.allCookies() where c.domain.lowercased().contains("febbox") {
+                      await store.deleteCookie(c)
+                  }
+                  DiagLog.shared.log("web", "Signed out of FebBox.")
               }
           }
           CINESCOUT_EOF
