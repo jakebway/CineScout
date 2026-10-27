@@ -1743,6 +1743,11 @@ jobs:
                   if let share = result.share { remember(share: share, for: m.id, service: svc?.name ?? "FebBox") }
                   m = movie(m.id) ?? m
 
+                  if result.needsSignIn, let login = URL(string: Rules.load().resolved.febboxLoginURL ?? "https://www.febbox.com/login") {
+                      webSession = WebSession(movie: m, link: ExternalLink(service: svc?.name ?? "FebBox", url: result.share ?? login, label: nil), signIn: login)
+                      return
+                  }
+
                   if let video = result.videos.first {
                       let rules = Rules.load().resolved
                       let names = result.names
@@ -4043,6 +4048,8 @@ jobs:
                   var headers: [String: String] = [:]
                   /// File / item names seen on the share page (used to find it in the console later).
                   var names: [String] = []
+                  /// FebBox sent us to its sign-in page: you need to sign in once.
+                  var needsSignIn = false
               }
 
               private enum Goal: String { case findShare, onShare, console, remove }
@@ -4068,6 +4075,7 @@ jobs:
               private var removeClicked = false
               private var goneCount = 0
               private var removed = false
+              private var needsSignIn = false
               private var finished = false
               private var waiter: CheckedContinuation<Void, Never>?
               private var loop: Task<Void, Never>?
@@ -4133,7 +4141,7 @@ jobs:
                   DiagLog.shared.log("robot", "Start: \(knownShare?.absoluteString ?? page?.absoluteString ?? "")")
                   await drive(seconds: rules.robotTimeout ?? 60)
 
-                  var result = Result(share: share, videos: videos, names: names)
+                  var result = Result(share: share, videos: videos, names: names, needsSignIn: needsSignIn)
                   if let v = videos.first {
                       let all = await webView.configuration.websiteDataStore.httpCookieStore.allCookies()
                       let host = v.host?.lowercased() ?? ""
@@ -4569,6 +4577,12 @@ jobs:
                   isServiceSite(u) && (accept == nil || Scraper.matches(accept, u.absoluteString))
               }
 
+              private func isLoginPage(_ u: URL) -> Bool {
+                  let p = u.path.lowercased()
+                  if let login = URL(string: rules.febboxLoginURL ?? ""), !login.path.isEmpty, login.path != "/", p.hasPrefix(login.path.lowercased()) { return true }
+                  return p.contains("/login") || p.contains("/signin") || p.contains("/sign-in")
+              }
+
               private func isSameSite(_ u: URL) -> Bool {
                   guard let h = u.host?.lowercased(), let siteBase else { return false }
                   return Scraper.baseDomain(h) == siteBase
@@ -4582,22 +4596,25 @@ jobs:
                   }
                   guard navigationAction.targetFrame?.isMainFrame ?? true else { return .allow }
                   if isServiceSite(url) && !isAcceptedShare(url) {
-                      switch goal {
-                      case .findShare:
-                          // On the way to the share page: refuse any other FebBox address.
-                          DiagLog.shared.log("robot", "Refused \(url.absoluteString) (not a share page)")
+                      if goal == .findShare {
+                          // Only BEFORE the share page is found: refuse any other FebBox address.
+                          DiagLog.shared.log("robot", "Refused \(url.absoluteString) (share page not found yet)")
                           return .cancel
-                      case .onShare:
-                          // Before accepting, stay on the share page; after accepting, FebBox may take us to the console.
-                          if accepted || navigationAction.navigationType == .linkActivated {
-                              if accepted { enter(.console); say("Opening your FebBox collaborative files…") }
-                              return .allow
-                          }
-                          DiagLog.shared.log("robot", "Refused \(url.absoluteString) (not a share page)")
-                          return .cancel
-                      case .console, .remove:
-                          return .allow
                       }
+                      if isLoginPage(url) {
+                          // Signed out: stop and let you sign in once.
+                          DiagLog.shared.log("robot", "FebBox asked to sign in (\(url.absoluteString)).")
+                          needsSignIn = true
+                          finish()
+                          return .cancel
+                      }
+                      // Once the share page has loaded, it may forward anywhere (console, preview…).
+                      if goal == .onShare {
+                          DiagLog.shared.log("robot", "Share page forwarded to \(url.absoluteString)")
+                          enter(.console)
+                          say("Opening your FebBox console…")
+                      }
+                      return .allow
                   }
                   if goal == .findShare && isAcceptedShare(url) {
                       foundShare(url)
@@ -4778,6 +4795,7 @@ jobs:
               var febboxAcceptPattern: String?
               var febboxConfirmPattern: String?
               var febboxConsoleURL: String?
+              var febboxLoginURL: String?
               var febboxCollabPattern: String?
               var febboxRemovePattern: String?
               var febboxMorePattern: String?
@@ -4787,7 +4805,7 @@ jobs:
               var febboxPreviewPattern: String?
 
               static let defaults = Rules(
-                  version: 9,
+                  version: 10,
                   note: "CineScout scanner rules. Claude can send you a new version of this file: paste it in Diagnostics → Scanner rules, save, then rescan. Optional `script` is JavaScript defining extract(html, url) that returns {title, year, overview, poster, videos: [], playLinks: [], links: [], isMovie}; call log(text) to write to the diagnostic log.",
                   playLabelPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:play|watch|stream|view online|start watching|resume|download|direct link|mirror|server)\b|\b(?:2160p|1080p|720p|480p|4k|full movie)\b|^\s*[▶►⏵]"#,
                   genericLabelPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:play|play now|watch|watch now|watch online|watch movie|watch free|stream|stream now|view|download|download now|direct link|link|here|click here|more|more info|info|details|trailer|open|start|resume|next|previous|prev|back|home|menu|login|log in|sign in|register|search|parent directory|\.\./?|name|last modified|size|description|(?:server|mirror|source|part|episode|ep|season|page)\s*#?\d*|\d{3,4}p|4k|uhd|hd|sd|mp4|mkv|m3u8|open in \S+(?: app)?|»|«|›|‹|\d{1,2})\s*$"#,
@@ -4828,6 +4846,7 @@ jobs:
                   febboxAcceptPattern: #"(?i)^\s*accept(?:\s+(?:the\s+)?collaborat(?:ion|e))?(?:\s+invitation)?\s*$"#,
                   febboxConfirmPattern: #"(?i)^\s*(?:ok|okay|confirm|yes|sure|accept|agree|continue|remove|delete|exit|leave|done)\s*$"#,
                   febboxConsoleURL: "https://www.febbox.com/console",
+                  febboxLoginURL: "https://www.febbox.com/login",
                   febboxCollabPattern: #"(?i)^\s*(?:collaborat(?:ion|ions|ive|ive files|ed)|shared with me|shared|co-?operation)\s*$"#,
                   febboxRemovePattern: #"(?i)^\s*(?:remove(?: from (?:list|collaboration))?|exit(?: collaboration)?|leave(?: collaboration)?|quit(?: collaboration)?|cancel collaboration|stop collaborat(?:ing|ion)|delete)\s*$"#,
                   febboxMorePattern: #"(?i)^\s*(?:⋯|…|\.\.\.|more|more actions|menu|options)\s*$"#,
@@ -4869,6 +4888,7 @@ jobs:
                       febboxAcceptPattern: febboxAcceptPattern ?? d.febboxAcceptPattern,
                       febboxConfirmPattern: febboxConfirmPattern ?? d.febboxConfirmPattern,
                       febboxConsoleURL: febboxConsoleURL ?? d.febboxConsoleURL,
+                      febboxLoginURL: febboxLoginURL ?? d.febboxLoginURL,
                       febboxCollabPattern: febboxCollabPattern ?? d.febboxCollabPattern,
                       febboxRemovePattern: febboxRemovePattern ?? d.febboxRemovePattern,
                       febboxMorePattern: febboxMorePattern ?? d.febboxMorePattern,
@@ -6950,6 +6970,8 @@ jobs:
               let id = UUID()
               let movie: Movie
               let link: ExternalLink
+              /// Open FebBox's sign-in page first.
+              var signIn: URL? = nil
           }
 
           // MARK: Model
@@ -6976,6 +6998,8 @@ jobs:
               var lockPattern: NSRegularExpression?
               /// While signing in, FebBox pages may move freely.
               private var freeBrowsingUntil = Date.distantPast
+              /// Once the share page has loaded it may forward anywhere (console, preview…).
+              private var shareReached = false
               private var observations: [NSKeyValueObservation] = []
               private var lastHandOff: (URL, Date)?
 
@@ -7080,7 +7104,7 @@ jobs:
               /// For signing in: lets FebBox move between its own pages for 10 minutes.
               func loadForSignIn(_ url: URL) {
                   freeBrowsingUntil = Date().addingTimeInterval(600)
-                  notice = "Sign in, then tap ⋯ → Back to the Share Page."
+                  notice = "Sign in to FebBox (you'll stay signed in). Then tap ⋯ → Back to the Share Page, or tap Done and press Play again."
                   webView.load(URLRequest(url: url))
               }
 
@@ -7138,9 +7162,13 @@ jobs:
                       Task { await handOff(url) }
                       return .cancel
                   }
-                  // Stay on the share page: refuse FebBox redirects to any other FebBox address.
+                  // Until the share page has loaded, refuse FebBox redirects to any other FebBox address.
+                  if let url = navigationAction.request.url, let lock = lockPattern, Scraper.matches(lock, url.absoluteString) {
+                      return .allow
+                  }
                   if let url = navigationAction.request.url,
                      navigationAction.targetFrame?.isMainFrame ?? true,
+                     !shareReached,
                      Date() > freeBrowsingUntil,
                      let lock = lockPattern,
                      let host = url.host?.lowercased(), Scraper.matches(serviceHost, host),
@@ -7148,7 +7176,7 @@ jobs:
                      navigationAction.navigationType != .linkActivated,
                      navigationAction.navigationType != .formSubmitted {
                       DiagLog.shared.log("web", "Refused redirect to \(url.absoluteString) (not a share page)")
-                      notice = "FebBox tried to send you to \(url.path.isEmpty ? url.absoluteString : url.path). CineScout stayed on the share page. If you need to sign in, tap ⋯ → Sign In to FebBox."
+                      notice = "FebBox tried to send you to \(url.path.isEmpty ? url.absoluteString : url.path) before the share page loaded. If you need to sign in, tap ⋯ → Sign In to FebBox."
                       return .cancel
                   }
                   return .allow
@@ -7162,6 +7190,13 @@ jobs:
                       return .cancel
                   }
                   return .allow
+              }
+
+              func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+                  if let u = webView.url, let lock = lockPattern, Scraper.matches(lock, u.absoluteString), !shareReached {
+                      shareReached = true
+                      DiagLog.shared.log("web", "Share page loaded; it may now forward to your console.")
+                  }
               }
 
               func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -7269,7 +7304,9 @@ jobs:
                               Menu {
                                   Button { model.load(session.link.url) } label: { Label("Back to the Share Page", systemImage: "arrow.uturn.backward") }
                                   Button {
-                                      if let host = session.link.url.host, let home = URL(string: "https://\(host)") { model.loadForSignIn(home) }
+                                      if let login = URL(string: Rules.load().resolved.febboxLoginURL ?? "https://www.febbox.com/login") {
+                                          model.loadForSignIn(login)
+                                      }
                                   } label: { Label("Sign In to \(session.link.service)", systemImage: "person.crop.circle") }
                                   Button { model.webView.reload() } label: { Label("Reload", systemImage: "arrow.clockwise") }
                                   Button { openURL(session.link.url) } label: {
@@ -7297,8 +7334,13 @@ jobs:
                              !pattern.isEmpty {
                               model.installHighlighter(pattern: pattern)
                           }
-                          DiagLog.shared.log("web", "Opening \(session.link.service) for “\(session.movie.title)”: \(session.link.url.absoluteString)")
-                          model.load(session.link.url)
+                          if let login = session.signIn {
+                              DiagLog.shared.log("web", "Opening the \(session.link.service) sign-in page.")
+                              model.loadForSignIn(login)
+                          } else {
+                              DiagLog.shared.log("web", "Opening \(session.link.service) for “\(session.movie.title)”: \(session.link.url.absoluteString)")
+                              model.load(session.link.url)
+                          }
                       }
                   }
                   .fullScreenCover(item: $preparing) { job in
