@@ -4145,6 +4145,7 @@ jobs:
                   }
                   if let knownShare {
                       share = knownShare
+                      if sharePlay { useDesktopSite() }
                       enter(.onShare)
                       say("Opening the FebBox share page…")
                       webView.load(URLRequest(url: knownShare))
@@ -4161,7 +4162,7 @@ jobs:
                   await drive(seconds: stopAtShare ? (rules.robotTimeout ?? 60) : max(rules.robotTimeout ?? 60, 120))
 
                   // For removal afterwards: exactly the folder that was opened, never a guess.
-                  var result = Result(share: share, videos: videos, names: openedFolder.map { [$0] } ?? names, needsSignIn: needsSignIn)
+                  var result = Result(share: share, videos: videos, names: accepted ? (openedFolder.map { [$0] } ?? names) : [], needsSignIn: needsSignIn)
                   if let v = videos.first {
                       let all = await webView.configuration.websiteDataStore.httpCookieStore.allCookies()
                       let host = v.host?.lowercased() ?? ""
@@ -4257,6 +4258,7 @@ jobs:
                       finish()
                       return
                   }
+                  if sharePlay { useDesktopSite() }
                   enter(.onShare)
                   say("Opening the FebBox share page…")
                   webView.load(URLRequest(url: url))
@@ -4340,7 +4342,10 @@ jobs:
                   }
               }
 
+              private var sharePlay: Bool { rules.febboxSharePlay ?? true }
+
               private func probeShare() async {
+                  if sharePlay { await probeSharePreview(); return }
                   let doAccept = rules.febboxAutoAccept ?? true
                   let out = await evaluate("""
                   (function (acceptSrc, confirmSrc, previewSrc, doAccept, accepted, clicked) {
@@ -4381,6 +4386,58 @@ jobs:
                   }
                   // Give the share page a few tries; if it won't play here, use the console.
                   if probes >= (accepted ? 9 : 6) { goToConsole() }
+              }
+
+              /// Your way: the share page on FebBox's desktop site → tap the file (4K first) → tap ▶ in the middle.
+              /// No Accept and nothing saved to your FebBox, so there's nothing to remove afterwards.
+              private func probeSharePreview() async {
+                  let out = await evaluate("""
+                  (function (files, clicked, fileOpen) {
+                    const names = CS.fileNames(), title = CS.title();
+                    const vids = CS.videoSources();
+                    if (vids.length) return JSON.stringify({ videos: vids, names, title });
+                    const want = files.length ? files : names;
+                    // The file's preview screen is open: tap ▶ in the middle of the poster.
+                    if (fileOpen) {
+                      const pl = CS.centerPlay(clicked);
+                      if (pl) return JSON.stringify({ clicked: pl, kind: 'play', names, title });
+                      return JSON.stringify({ names, title, waiting: true });
+                    }
+                    // The file list: tap the best file (4K first).
+                    for (let i = 0; i < want.length; i++) {
+                      const f = CS.findName([want[i]]);
+                      if (!f) continue;
+                      const s = CS.clickElement(f, clicked);
+                      if (s) return JSON.stringify({ clicked: s, kind: 'file', names, title });
+                    }
+                    return JSON.stringify({ names, title });
+                  })(\(fileNamesJSON), \(clickedJSON), \(probes - lastFileProbe < 9))
+                  """)
+                  collectNames(out)
+                  if let list = out["videos"] as? [String] {
+                      for s in list { if let u = URL(string: s) { foundVideo(u) } }
+                      return
+                  }
+                  if let c = out["clicked"] as? String {
+                      clicked.append(c)
+                      switch out["kind"] as? String {
+                      case "file":
+                          lastFileProbe = probes
+                          DiagLog.shared.log("robot", "Opened the file “\(label(c))” on the share page.")
+                          say("Opening “\(label(c))”…")
+                          Task { [weak self] in
+                              try? await Task.sleep(nanoseconds: 7_000_000_000)
+                              guard let self, !self.finished else { return }
+                              await self.saveSample()
+                          }
+                      case "play":
+                          DiagLog.shared.log("robot", "Tapped play (\(label(c))).")
+                          say("Starting FebBox's preview…")
+                      default: break
+                      }
+                  }
+                  // Nothing playable after trying every file: show the share page so you can tap it yourself.
+                  if probes == 45 { await saveSample() }
               }
 
               /// Your screens, in order: Accept (share page) → Accept ("Working Together") → "Save to": pick Movies → Save
@@ -4659,6 +4716,38 @@ jobs:
                   return out;
                 },
                 fileLike: function (t) { return CS.extRe.test(t) || /(?:^|[ ._-])(?:2160p|1080p|720p|480p|x26[45]|h\\.?26[45]|hevc|bluray|web-?dl|webrip|remux)(?:[ ._-]|$)/i.test(t); },
+                centerPlay: function (clicked) {
+                  // A real play button first (by class or label), then whatever sits in the middle of the big poster.
+                  var btn = Array.from(document.querySelectorAll('[class*=play], [aria-label*=lay], [title*=lay], .vjs-big-play-button, .plyr__control--overlaid, .dplayer-mobile-play, button'))
+                    .filter(function (b) {
+                      var cls = (typeof b.className === 'string' ? b.className : '') + ' ' + (b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '');
+                      var isPlay = /(?:^|[\\s_-])play(?:er)?(?:[\\s_-]|btn|button|icon|$)/i.test(cls) || /^\\s*(?:▶|play)\\s*$/i.test(CS.text(b));
+                      return isPlay && CS.visible(b) && !b.closest('.play_video') && !/download|attribute|open in|feb app/i.test(CS.text(b));
+                    })
+                    .filter(function (b) { var r = b.getBoundingClientRect(); return r.width >= 24 && r.width <= 260 && r.height >= 24; })
+                    .find(function (b) { return clicked.indexOf('play|' + CS.sig(b, CS.text(b) || b.tagName)) < 0; });
+                  if (btn) {
+                    var s1 = 'play|' + CS.sig(btn, CS.text(btn) || btn.tagName);
+                    try { btn.scrollIntoView({ block: 'center' }); } catch (e) {}
+                    btn.click(); return s1;
+                  }
+                  var big = null, area = 0;
+                  document.querySelectorAll('img, video, canvas, [style*=background-image]').forEach(function (e) {
+                    var r = e.getBoundingClientRect(), a = r.width * r.height;
+                    if (a > area && r.width > 150 && r.height > 150) { area = a; big = e; }
+                  });
+                  if (!big) return null;
+                  var s2 = 'play|center|' + (big.getAttribute('src') || big.tagName).slice(0, 60);
+                  if (clicked.indexOf(s2) >= 0) return null;
+                  try { big.scrollIntoView({ block: 'center' }); } catch (e) {}
+                  var r = big.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + r.height / 2;
+                  var hit = document.elementFromPoint(x, y) || big;
+                  ['mousedown', 'mouseup', 'click'].forEach(function (n) {
+                    hit.dispatchEvent(new MouseEvent(n, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
+                  });
+                  document.querySelectorAll('video').forEach(function (v) { try { v.play(); } catch (e) {} });
+                  return s2;
+                },
                 openFile: function (el, clicked) {
                   var tile = el.closest('.play_video, [data-id], tr, li') || el;
                   var sig = 'open|' + CS.text(el).slice(0, 80) + '|' + (tile.getAttribute('data-id') || '');
@@ -4872,7 +4961,10 @@ jobs:
                           return .cancel
                       }
                       // Once the share page has loaded, it may forward anywhere (console, preview…).
-                      if goal == .onShare {
+                      if goal == .onShare && sharePlay {
+                          // Opening a file's preview from the share page: stay on this step.
+                          DiagLog.shared.log("robot", "Share page opened \(url.absoluteString)")
+                      } else if goal == .onShare {
                           DiagLog.shared.log("robot", "Share page forwarded to \(url.absoluteString)")
                           enter(.console)
                           say("Opening your FebBox console…")
@@ -5086,9 +5178,11 @@ jobs:
               var febboxFilesPattern: String?
               /// Use FebBox's desktop site in the console (its file previews only play there).
               var febboxDesktopPreview: Bool?
+              /// Play straight from the share page's desktop preview (tap the file, tap ▶). No Accept, nothing saved.
+              var febboxSharePlay: Bool?
 
               static let defaults = Rules(
-                  version: 14,
+                  version: 15,
                   note: "CineScout scanner rules. Claude can send you a new version of this file: paste it in Diagnostics → Scanner rules, save, then rescan. Optional `script` is JavaScript defining extract(html, url) that returns {title, year, overview, poster, videos: [], playLinks: [], links: [], isMovie}; call log(text) to write to the diagnostic log.",
                   playLabelPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:play|watch|stream|view online|start watching|resume|download|direct link|mirror|server)\b|\b(?:2160p|1080p|720p|480p|4k|full movie)\b|^\s*[▶►⏵]"#,
                   genericLabelPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:play|play now|watch|watch now|watch online|watch movie|watch free|stream|stream now|view|download|download now|direct link|link|here|click here|more|more info|info|details|trailer|open|start|resume|next|previous|prev|back|home|menu|login|log in|sign in|register|search|parent directory|\.\./?|name|last modified|size|description|(?:server|mirror|source|part|episode|ep|season|page)\s*#?\d*|\d{3,4}p|4k|uhd|hd|sd|mp4|mkv|m3u8|open in \S+(?: app)?|»|«|›|‹|\d{1,2})\s*$"#,
@@ -5139,7 +5233,8 @@ jobs:
                   febboxSaveFolder: "Movies",
                   febboxSavePattern: #"(?i)^\s*(?:save|save here|confirm|ok)\s*$"#,
                   febboxFilesPattern: #"(?i)^\s*(?:files|my files|all files)\s*$"#,
-                  febboxDesktopPreview: true
+                  febboxDesktopPreview: true,
+                  febboxSharePlay: true
               )
 
               /// These rules with built-in defaults filled in for anything missing.
@@ -5186,7 +5281,8 @@ jobs:
                       febboxSaveFolder: febboxSaveFolder ?? d.febboxSaveFolder,
                       febboxSavePattern: febboxSavePattern ?? d.febboxSavePattern,
                       febboxFilesPattern: febboxFilesPattern ?? d.febboxFilesPattern,
-                      febboxDesktopPreview: febboxDesktopPreview ?? d.febboxDesktopPreview
+                      febboxDesktopPreview: febboxDesktopPreview ?? d.febboxDesktopPreview,
+                      febboxSharePlay: febboxSharePlay ?? d.febboxSharePlay
                   )
               }
 
@@ -7406,6 +7502,11 @@ jobs:
               @Published private(set) var desktop = false
 
               /// FebBox's file previews play on its desktop site.
+              func setDesktop(_ on: Bool) {
+                  desktop = on
+                  webView.customUserAgent = on ? BrowserRobot.desktopUserAgent : nil
+              }
+
               func toggleDesktop() {
                   desktop.toggle()
                   webView.customUserAgent = desktop ? BrowserRobot.desktopUserAgent : nil
@@ -7589,7 +7690,7 @@ jobs:
                           if !hintDismissed {
                               HStack(alignment: .top, spacing: 10) {
                                   Image(systemName: "play.rectangle.fill").foregroundStyle(.orange)
-                                  Text("Sign in if \(session.link.service) asks (you'll stay signed in). Then tap \(session.link.service)'s own **Play** or **Download** on the file, and CineScout downloads it, compresses it, plays it, and deletes it when you close the player.")
+                                  Text("Sign in if \(session.link.service) asks (you'll stay signed in). Then tap the file, then **▶** in the middle of the next screen. CineScout takes over and plays it here. Nothing is saved to your \(session.link.service).")
                                       .font(.footnote)
                                       .fixedSize(horizontal: false, vertical: true)
                                   Spacer(minLength: 0)
@@ -7654,13 +7755,23 @@ jobs:
                   .preferredColorScheme(.dark)
                   .onAppear {
                       model.onVideo = { url, cookies, headers in
-                          // Download → compress → play → delete.
-                          preparing = PrepareJob(movie: session.movie, url: url, cookies: cookies, headers: headers)
+                          if Rules.load().resolved.febboxStreamPreview ?? true {
+                              // FebBox's preview stream plays directly in CineScout's player.
+                              let req = store.request(for: session.movie, url: url, cookies: cookies, headers: headers)
+                              dismiss()
+                              DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { store.nowPlaying = req }
+                          } else {
+                              // Download → compress → play → delete.
+                              preparing = PrepareJob(movie: session.movie, url: url, cookies: cookies, headers: headers)
+                          }
                       }
                       if model.webView.url == nil {
                           if let svc = Rules.load().externalServices?.first(where: { $0.name == session.link.service }) {
                               model.serviceHost = Scraper.regex(svc.hostPattern, name: "hostPattern")
                               model.lockPattern = Scraper.regex(svc.acceptPattern, name: "acceptPattern")
+                              // FebBox's share page plays previews on its desktop site.
+                              let r = Rules.load().resolved
+                              if svc.name == "FebBox", r.febboxSharePlay ?? true, r.febboxDesktopPreview ?? true { model.setDesktop(true) }
                           }
                           if let pattern = Rules.load().externalServices?.first(where: { $0.name == session.link.service })?.highlightPattern,
                              !pattern.isEmpty {
