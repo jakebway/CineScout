@@ -1736,7 +1736,7 @@ jobs:
                   backgroundRobot?.cancel()
                   let r = BrowserRobot(rules: Rules.load()) { [weak self] text in self?.robotStatus = text }
                   robot = r
-                  let result = await r.run(page: m.pageURL, share: knownShare)
+                  let result = await r.run(page: m.pageURL, share: knownShare, title: m.title)
                   robot = nil
                   robotStatus = nil
 
@@ -4123,8 +4123,12 @@ jobs:
               ///   - page: the movie's page on your site (used when the share link isn't known yet)
               ///   - share: a known FebBox share link (skips the site steps)
               ///   - stopAtShare: background mode — stop once the share link is found
-              func run(page: URL?, share knownShare: URL?, stopAtShare: Bool = false) async -> Result {
+              func run(page: URL?, share knownShare: URL?, title: String? = nil, stopAtShare: Bool = false) async -> Result {
                   self.stopAtShare = stopAtShare
+                  if let title {
+                      let clean = Scraper.cleanTitle(stem: title, dotsAreSpaces: false).0
+                      if clean.count > 2 { names.append(clean) }
+                  }
                   if let knownShare {
                       share = knownShare
                       enter(.onShare)
@@ -4164,11 +4168,11 @@ jobs:
                   names = itemNames.filter { !$0.isEmpty }
                   guard !names.isEmpty, let console = URL(string: rules.febboxConsoleURL ?? "") else { return false }
                   enter(.remove)
-                  say("Removing it from your collaborative files…")
+                  say("Removing it from Shared…")
                   DiagLog.shared.log("robot", "Remove from collaborative files: \(names.prefix(3).joined(separator: " | "))")
                   webView.load(URLRequest(url: console))
                   await drive(seconds: 75)
-                  DiagLog.shared.log("robot", removed ? "Removed from collaborative files." : "Couldn't confirm the removal (will try again later).")
+                  DiagLog.shared.log("robot", removed ? "Removed from Shared." : "Couldn't confirm the removal (will try again later).")
                   detach()
                   return removed
               }
@@ -4257,7 +4261,7 @@ jobs:
                   }
                   Task { await saveSample() }
                   enter(.console)
-                  say("Opening your FebBox collaborative files…")
+                  say("Opening your FebBox console…")
                   webView.load(URLRequest(url: console))
               }
 
@@ -4363,9 +4367,13 @@ jobs:
 
               private func probeConsole() async {
                   let out = await evaluate("""
-                  (function (confirmSrc, collabSrc, previewSrc, names, clicked) {
+                  (function (acceptSrc, doAccept, accepted, confirmSrc, collabSrc, previewSrc, names, clicked) {
                     const vids = CS.videoSources();
                     if (vids.length) return JSON.stringify({ videos: vids });
+                    if (doAccept && !accepted) {
+                      const a = CS.clickText(new RegExp(acceptSrc, 'i'), clicked, 45);
+                      if (a) return JSON.stringify({ clicked: a, kind: 'accept' });
+                    }
                     const c0 = CS.clickText(new RegExp(confirmSrc, 'i'), clicked, 20);
                     if (c0) return JSON.stringify({ clicked: c0, kind: 'confirm' });
                     const item = CS.findName(names);
@@ -4377,7 +4385,7 @@ jobs:
                     if (sig) return JSON.stringify({ clicked: sig, kind: 'item', present: true });
                     const p = CS.clickText(new RegExp(previewSrc, 'i'), clicked, 30);
                     return JSON.stringify(p ? { clicked: p, kind: 'preview', present: true } : { present: true });
-                  })(\(js(playConfirm)), \(js(rules.febboxCollabPattern)), \(js(rules.febboxPreviewPattern)), \(namesJSON), \(clickedJSON))
+                  })(\(js(rules.febboxAcceptPattern)), \(rules.febboxAutoAccept ?? true), \(accepted), \(js(playConfirm)), \(js(rules.febboxCollabPattern)), \(js(rules.febboxPreviewPattern)), \(namesJSON), \(clickedJSON))
                   """)
                   if let list = out["videos"] as? [String] {
                       for s in list { if let u = URL(string: s) { foundVideo(u) } }
@@ -4386,8 +4394,16 @@ jobs:
                   if let c = out["clicked"] as? String {
                       clicked.append(c)
                       switch out["kind"] as? String {
-                      case "section": say("Opening collaborative files…")
-                      case "item": say("Opening “\(label(c))”…")
+                      case "accept":
+                          accepted = true
+                          DiagLog.shared.log("robot", "Tapped “\(label(c))” in the console.")
+                          say("Accepting the collaboration…")
+                      case "section": say("Opening Shared…")
+                      case "item":
+                          // Remember exactly what we opened, so the same item is removed afterwards.
+                          let opened = label(c)
+                          if opened.count > 2 && !names.contains(opened) { names.insert(opened, at: 0) }
+                          say("Opening “\(opened)”…")
                       case "preview": say("Starting FebBox's preview…")
                       default: break
                       }
@@ -4518,14 +4534,15 @@ jobs:
                   });
                   return out;
                 },
+                norm: function (s) { return (s || '').toLowerCase().replace(/\\.[a-z0-9]{2,4}$/, '').replace(/[^a-z0-9]+/g, ' ').trim(); },
                 findName: function (names) {
-                  var wanted = names.map(function (n) { return n.toLowerCase(); }).concat(
-                    names.map(function (n) { return n.toLowerCase().replace(/\\.[a-z0-9]{2,4}$/, ''); })).filter(function (n) { return n.length > 2; });
+                  var wanted = names.map(CS.norm).filter(function (n) { return n.length > 2; });
                   var els = CS.all();
                   for (var i = 0; i < els.length; i++) {
                     var el = els[i]; if (el.children.length > 3 || !CS.visible(el)) continue;
-                    var t = CS.text(el).toLowerCase(); if (!t || t.length > 220) continue;
-                    for (var j = 0; j < wanted.length; j++) { if (t.indexOf(wanted[j]) >= 0) return el; }
+                    var raw = CS.text(el); if (!raw || raw.length > 220) continue;
+                    var t = ' ' + CS.norm(raw) + ' ';
+                    for (var j = 0; j < wanted.length; j++) { if (t.indexOf(' ' + wanted[j] + ' ') >= 0 || t.indexOf(' ' + wanted[j]) >= 0) return el; }
                   }
                   return null;
                 }
@@ -4805,7 +4822,7 @@ jobs:
               var febboxPreviewPattern: String?
 
               static let defaults = Rules(
-                  version: 10,
+                  version: 11,
                   note: "CineScout scanner rules. Claude can send you a new version of this file: paste it in Diagnostics → Scanner rules, save, then rescan. Optional `script` is JavaScript defining extract(html, url) that returns {title, year, overview, poster, videos: [], playLinks: [], links: [], isMovie}; call log(text) to write to the diagnostic log.",
                   playLabelPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:play|watch|stream|view online|start watching|resume|download|direct link|mirror|server)\b|\b(?:2160p|1080p|720p|480p|4k|full movie)\b|^\s*[▶►⏵]"#,
                   genericLabelPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:play|play now|watch|watch now|watch online|watch movie|watch free|stream|stream now|view|download|download now|direct link|link|here|click here|more|more info|info|details|trailer|open|start|resume|next|previous|prev|back|home|menu|login|log in|sign in|register|search|parent directory|\.\./?|name|last modified|size|description|(?:server|mirror|source|part|episode|ep|season|page)\s*#?\d*|\d{3,4}p|4k|uhd|hd|sd|mp4|mkv|m3u8|open in \S+(?: app)?|»|«|›|‹|\d{1,2})\s*$"#,
@@ -4847,7 +4864,7 @@ jobs:
                   febboxConfirmPattern: #"(?i)^\s*(?:ok|okay|confirm|yes|sure|accept|agree|continue|remove|delete|exit|leave|done)\s*$"#,
                   febboxConsoleURL: "https://www.febbox.com/console",
                   febboxLoginURL: "https://www.febbox.com/login",
-                  febboxCollabPattern: #"(?i)^\s*(?:collaborat(?:ion|ions|ive|ive files|ed)|shared with me|shared|co-?operation)\s*$"#,
+                  febboxCollabPattern: #"(?i)^\s*(?:shared|shared files|shared with me|my shared)\s*$"#,
                   febboxRemovePattern: #"(?i)^\s*(?:remove(?: from (?:list|collaboration))?|exit(?: collaboration)?|leave(?: collaboration)?|quit(?: collaboration)?|cancel collaboration|stop collaborat(?:ing|ion)|delete)\s*$"#,
                   febboxMorePattern: #"(?i)^\s*(?:⋯|…|\.\.\.|more|more actions|menu|options)\s*$"#,
                   febboxStreamPreview: true,
