@@ -1503,6 +1503,8 @@ jobs:
               @Published var scanState: ScanState = .idle
               @Published var nowPlaying: PlayRequest?
               @Published var webSession: WebSession?
+              /// A plain-English message shown as an alert.
+              @Published var alertMessage: String?
               /// Movies found by the most recent scan (used by first-time setup).
               @Published private(set) var lastScanFound = 0
 
@@ -1735,8 +1737,59 @@ jobs:
                   var l = link
                   if let svc = Rules.load().externalServices?.first(where: { $0.name == link.service }) {
                       l.url = svc.canonical(link.url)
+                      guard svc.accepts(l.url) else {
+                          DiagLog.shared.log("open", "Won't open \(l.url.absoluteString) for “\(movie.title)”: not a \(svc.name) share link. Looking for the share link instead.")
+                          Task { await findShareLink(for: movie, service: svc) }
+                          return
+                      }
                   }
                   webSession = WebSession(movie: movie, link: l)
+              }
+
+              /// Drops a non-share link and follows the movie's page (Watch now → Download → …)
+              /// until its share link turns up, then opens that.
+              private func findShareLink(for movie: Movie, service svc: ExternalService) async {
+                  guard let i = movies.firstIndex(where: { $0.id == movie.id }) else { return }
+                  movies[i].externalLinks.removeAll { !svc.accepts(svc.canonical($0.url)) }
+                  if let page = movies[i].pageURL, !movies[i].pendingLinks.contains(page) {
+                      movies[i].pendingLinks.append(page)
+                  }
+                  guard movies[i].needsLookup else {
+                      alertMessage = "CineScout couldn't find a \(svc.name) share link for this movie."
+                      return
+                  }
+                  let found = await lookUpNow(movies[i])
+                  if let m = found, let share = m.externalLinks.first(where: { $0.service == svc.name && svc.accepts($0.url) }) {
+                      webSession = WebSession(movie: m, link: share)
+                  } else if let m = found, m.hasVideo {
+                      play(m)
+                  } else {
+                      alertMessage = "CineScout followed this movie's page but didn't find a \(svc.name) share link. Send Claude a report from Settings so it can look."
+                  }
+              }
+
+              /// Libraries saved by older versions may hold FebBox links that aren't share links
+              /// (like the site's account page). Remove them and look up the real share link instead.
+              private func cleanServiceLinks() {
+                  let services = Rules.load().externalServices ?? []
+                  var fixed = 0
+                  for i in movies.indices {
+                      let before = movies[i].externalLinks.count
+                      movies[i].externalLinks.removeAll { l in
+                          guard let svc = services.first(where: { $0.name == l.service }) else { return false }
+                          return !svc.accepts(svc.canonical(l.url))
+                      }
+                      guard movies[i].externalLinks.count != before else { continue }
+                      fixed += 1
+                      if !movies[i].hasVideo, movies[i].externalLinks.isEmpty, let page = movies[i].pageURL,
+                         !movies[i].pendingLinks.contains(page) {
+                          movies[i].pendingLinks.append(page)
+                      }
+                  }
+                  if fixed > 0 {
+                      DiagLog.shared.log("open", "Removed non-share FebBox links from \(fixed) movie(s); their share links will be looked up.")
+                      save()
+                  }
               }
 
               func resumePosition(_ id: String) -> Double? {
@@ -2022,6 +2075,7 @@ jobs:
                      let p = try? JSONDecoder().decode([String: WatchProgress].self, from: data) {
                       progress = p
                   }
+                  cleanServiceLinks()
               }
 
               private func save() {
@@ -2068,6 +2122,11 @@ jobs:
                   }
                   .sheet(item: $store.webSession) { session in
                       WebBrowserView(session: session).environmentObject(store)
+                  }
+                  .alert("Heads up", isPresented: Binding(get: { store.alertMessage != nil }, set: { if !$0 { store.alertMessage = nil } })) {
+                      Button("OK", role: .cancel) {}
+                  } message: {
+                      Text(store.alertMessage ?? "")
                   }
               }
           }
@@ -3796,6 +3855,16 @@ jobs:
               var canonicalTemplate: String?
               /// Button text to scroll to and highlight when the page opens.
               var highlightPattern: String?
+              /// The ONLY kind of address CineScout accepts for this service. Other links to the
+              /// service (account pages, home page) are ignored and the search keeps going.
+              var acceptPattern: String?
+              /// Finds accepted addresses written anywhere in a page (scripts, data, plain text).
+              var searchPattern: String?
+
+              func accepts(_ url: URL) -> Bool {
+                  guard let p = acceptPattern, !p.isEmpty else { return true }
+                  return url.absoluteString.range(of: p, options: .regularExpression) != nil
+              }
 
               /// Any form of this service's link → the one address CineScout opens.
               func canonical(_ url: URL) -> URL {
@@ -3859,7 +3928,7 @@ jobs:
               var resolvePlayLinksDuringScan: Bool?
 
               static let defaults = Rules(
-                  version: 6,
+                  version: 7,
                   note: "CineScout scanner rules. Claude can send you a new version of this file: paste it in Diagnostics → Scanner rules, save, then rescan. Optional `script` is JavaScript defining extract(html, url) that returns {title, year, overview, poster, videos: [], playLinks: [], links: [], isMovie}; call log(text) to write to the diagnostic log.",
                   playLabelPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:play|watch|stream|view online|start watching|resume|download|direct link|mirror|server)\b|\b(?:2160p|1080p|720p|480p|4k|full movie)\b|^\s*[▶►⏵]"#,
                   genericLabelPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:play|play now|watch|watch now|watch online|watch movie|watch free|stream|stream now|view|download|download now|direct link|link|here|click here|more|more info|info|details|trailer|open|start|resume|next|previous|prev|back|home|menu|login|log in|sign in|register|search|parent directory|\.\./?|name|last modified|size|description|(?:server|mirror|source|part|episode|ep|season|page)\s*#?\d*|\d{3,4}p|4k|uhd|hd|sd|mp4|mkv|m3u8|open in \S+(?: app)?|»|«|›|‹|\d{1,2})\s*$"#,
@@ -3884,7 +3953,9 @@ jobs:
                                           #"(?i)febbox\.com/(?:share|s)/([A-Za-z0-9_-]+)"#,
                                           #"(?i)febbox[^?#]*[?&#](?:share_key|sharekey|share|key)=([A-Za-z0-9_-]+)"#,
                                       ],
-                                      canonicalTemplate: "https://www.febbox.com/share/$1")
+                                      canonicalTemplate: "https://www.febbox.com/share/$1",
+                                      acceptPattern: #"(?i)^https?://(?:www\.)?febbox\.com/share/[A-Za-z0-9_-]+/?(?:[?#].*)?$"#,
+                                      searchPattern: #"(?i)https?://(?:www\.)?febbox\.com/share/[A-Za-z0-9_-]+"#)
                   ],
                   chainLabelPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:continue|proceed|next|next step|go|go to (?:the )?(?:video|movie|file|link|download)|get (?:the )?(?:link|video|file)|generate (?:download )?link|click (?:here )?to (?:watch|play|stream|continue|download|proceed)|start (?:download|streaming|watching)|download (?:now|file|video|movie)|direct (?:link|download)|watch (?:now|here|online|movie|full movie)|play (?:now|video|movie)|stream (?:now|here)|open (?:video|player|file)|(?:server|mirror|source|link|player|host|option)\s*#?\d+|hd|full ?hd|\d{3,4}p)\b"#,
                   maxPlayHops: 5,
@@ -4022,6 +4093,8 @@ jobs:
                       allPatterns.append(("externalServices \(svc.name) hostPattern", svc.hostPattern))
                       allPatterns.append(("externalServices \(svc.name) labelPattern", svc.labelPattern))
                       allPatterns.append(("externalServices \(svc.name) highlightPattern", svc.highlightPattern))
+                      allPatterns.append(("externalServices \(svc.name) acceptPattern", svc.acceptPattern))
+                      allPatterns.append(("externalServices \(svc.name) searchPattern", svc.searchPattern))
                       for p in svc.canonicalPatterns ?? [] { allPatterns.append(("externalServices \(svc.name) canonicalPatterns", p)) }
                   }
                   for (name, p) in allPatterns {
@@ -4157,6 +4230,20 @@ jobs:
                   let name: String
                   let host: NSRegularExpression?
                   let label: NSRegularExpression?
+                  let accept: NSRegularExpression?
+                  let search: NSRegularExpression?
+
+                  func accepts(_ u: URL) -> Bool { accept == nil || Scraper.matches(accept, u.absoluteString) }
+              }
+
+              private enum ServiceMatch {
+                  case none
+                  /// An address of the accepted kind (a FebBox share link).
+                  case accepted(ExternalLink)
+                  /// The service's site, but not an accepted address (e.g. an account page): ignore it.
+                  case rejected(String)
+                  /// Says it's for the service but points at your site: follow it to find the real address.
+                  case follow
               }
 
               private struct LinkInfo {
@@ -4238,7 +4325,9 @@ jobs:
                   self.services = (r.externalServices ?? []).map {
                       ServiceMatcher(service: $0, name: $0.name,
                                      host: Scraper.regex($0.hostPattern, name: "\($0.name) hostPattern"),
-                                     label: Scraper.regex($0.labelPattern, name: "\($0.name) labelPattern"))
+                                     label: Scraper.regex($0.labelPattern, name: "\($0.name) labelPattern"),
+                                     accept: Scraper.regex($0.acceptPattern, name: "\($0.name) acceptPattern"),
+                                     search: Scraper.regex($0.searchPattern, name: "\($0.name) searchPattern"))
                   }
                   self.scriptRelRE = Scraper.regex(#"(?i)["'](/[^"'\s<>]+?\.(?:"# + alt + #")(?:\?[^"'\s<>]*)?)["']"#, name: "script video")
               }
@@ -4334,6 +4423,15 @@ jobs:
                                   }
                                   keepSample("root", finalURL, html)
                               }
+                              if isServiceSite(finalURL) {
+                                  if let pid = hint?.parentID, let l = externalLink(finalURL, label: nil) {
+                                      attachExternal([l], to: pid)
+                                      log.debug("page", "\(url.absoluteString) led to \(l.url.absoluteString)")
+                                  } else {
+                                      log.debug("page", "Refused \(finalURL.absoluteString): not a share link")
+                                  }
+                                  break
+                              }
                               pages += 1
                               process(html: html, url: finalURL, depth: depth, hint: hint)
                           case .video:
@@ -4398,6 +4496,16 @@ jobs:
 
               /// Follow a link/embed that should lead to `parent`'s video.
               private func followPlay(_ url: URL, parent: String, depth: Int, hops: Int) {
+                  switch serviceMatch(url, label: nil) {
+                  case .accepted(let l):
+                      attachExternal([l], to: parent)
+                      return
+                  case .rejected(let name):
+                      log.debug("page", "Refused to follow a \(name) link that isn't a share link: \(url.absoluteString)")
+                      return
+                  default:
+                      break
+                  }
                   if isVideo(url) {
                       if !isExtra(url) { attach([url], to: parent) }
                       return
@@ -4450,20 +4558,51 @@ jobs:
 
               // MARK: Outside services (FebBox…)
 
-              /// If this link goes to (or says it opens) a service like FebBox, describe it.
-              private func externalLink(_ url: URL, label: String?) -> ExternalLink? {
+              /// Is this a FebBox (or other service) link, and is it the accepted kind?
+              private func serviceMatch(_ url: URL, label: String?) -> ServiceMatch {
                   let unwrapped = Self.unwrapRedirect(url)
                   for svc in services {
                       for candidate in [unwrapped, url] {
                           if let h = candidate.host?.lowercased(), Self.matches(svc.host, h) {
-                              return ExternalLink(service: svc.name, url: svc.service.canonical(candidate), label: label)
+                              let c = svc.service.canonical(candidate)
+                              return svc.accepts(c) ? .accepted(ExternalLink(service: svc.name, url: c, label: label)) : .rejected(svc.name)
                           }
                       }
-                      if let label, Self.matches(svc.label, label) {
-                          return ExternalLink(service: svc.name, url: url, label: label)
+                      if let label, Self.matches(svc.label, label) { return .follow }
+                  }
+                  return .none
+              }
+
+              /// Only accepted service addresses (e.g. febbox.com/share/…).
+              private func externalLink(_ url: URL, label: String?) -> ExternalLink? {
+                  if case .accepted(let l) = serviceMatch(url, label: label) { return l }
+                  return nil
+              }
+
+              private func isServiceSite(_ url: URL) -> Bool {
+                  guard let h = url.host?.lowercased() else { return false }
+                  return services.contains { Self.matches($0.host, h) }
+              }
+
+              /// Accepted service addresses written anywhere in the page (scripts, data, text).
+              private func serviceLinksInText(_ html: String) -> [ExternalLink] {
+                  var out: [ExternalLink] = []
+                  var texts = [html.replacingOccurrences(of: "\\/", with: "/")]
+                  if let decoded = html.removingPercentEncoding, decoded != html { texts.append(decoded) }
+                  for svc in services {
+                      guard let re = svc.search else { continue }
+                      for text in texts {
+                          let ns = text as NSString
+                          for m in re.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
+                              guard let u = URL(string: ns.substring(with: m.range)) else { continue }
+                              let c = svc.service.canonical(u)
+                              if svc.accepts(c), !out.contains(where: { $0.url == c }) {
+                                  out.append(ExternalLink(service: svc.name, url: c, label: nil))
+                              }
+                          }
                       }
                   }
-                  return nil
+                  return out
               }
 
               /// Links like "/go/123" labelled "Open in FebBox": follow the redirect once to get the
@@ -4620,8 +4759,8 @@ jobs:
                       if let u = comps.url, !jumps.contains(u) { jumps.append(u) }
                   }
 
-                  let goodRedirects = redirects.filter { isVideo($0) || isPlayTarget($0) }
-                  let goodJumps = jumps.filter { isVideo($0) || isPlayTarget($0) }
+                  let goodRedirects = redirects.filter { isVideo($0) || isPlayTarget($0) || externalLink($0, label: nil) != nil }
+                  let goodJumps = jumps.filter { isVideo($0) || isPlayTarget($0) || externalLink($0, label: nil) != nil }
                   return (goodRedirects, goodJumps)
               }
 
@@ -4761,15 +4900,24 @@ jobs:
                           continue
                       }
                       let raw = Self.linkLabel(a)
-                      if let ext = externalLink(u, label: raw) {
+                      var forcePlay = false
+                      switch serviceMatch(u, label: raw) {
+                      case .accepted(let ext):
                           if !externals.contains(where: { $0.link.url == ext.url }) {
                               let shownLabel = labelNamesService(raw) ? nil : usableLabel(raw)
                               externals.append(ExternalInfo(link: ExternalLink(service: ext.service, url: ext.url, label: shownLabel), element: a))
                           }
                           continue
+                      case .rejected(let name):
+                          log.debug("page", "Ignored a \(name) link that isn't a share link: \(u.absoluteString)")
+                          continue
+                      case .follow:
+                          forcePlay = true
+                      case .none:
+                          break
                       }
                       let info = LinkInfo(url: u, label: usableLabel(raw), poster: Self.imageIn(a, base: pageURL),
-                                          isPlay: isPlayLink(a, url: u, label: raw, rulePlay: rulePlay), element: a)
+                                          isPlay: forcePlay || isPlayLink(a, url: u, label: raw, rulePlay: rulePlay), element: a)
                       if isVideo(u) {
                           if !isExtra(u, label: raw) && !videoLinks.contains(where: { $0.url == u }) { videoLinks.append(info) }
                       } else if Self.key(u) != pageKey {
@@ -4862,7 +5010,7 @@ jobs:
                           if !found.contains(v.url) { found.append(v.url) }
                       }
                       attach(found, to: pid)
-                      attachExternal(externals.map(\.link), to: pid)
+                      attachExternal(externals.map(\.link) + serviceLinksInText(html), to: pid)
                       let hops = (hint?.hops ?? 0) + 1
                       if hops <= maxHops {
                           for u in redirects + jumps { followPlay(u, parent: pid, depth: depth, hops: hops) }
@@ -4873,7 +5021,7 @@ jobs:
                           log.log("page", "Stopped after \(maxHops) steps looking for the video of “\(pageEntries[pid]?.movie.title ?? pid)”. Raise maxPlayHops in Scanner rules if your site needs more.")
                       }
                       let title = pageEntries[pid]?.movie.title ?? pid
-                      if found.isEmpty && externals.isEmpty && iframes.isEmpty && playLinks.isEmpty && jsPlay.isEmpty && redirects.isEmpty && jumps.isEmpty {
+                      if found.isEmpty && externals.isEmpty && pageEntries[pid]?.movie.externalLinks.isEmpty != false && iframes.isEmpty && playLinks.isEmpty && jsPlay.isEmpty && redirects.isEmpty && jumps.isEmpty {
                           keepSample("play-page-no-video", pageURL, html)
                           log.log("page", "Opened a play link for “\(title)” but found no video on it: \(pageURL.absoluteString)")
                       } else {
@@ -4910,6 +5058,9 @@ jobs:
                                                  meta: meta, ld: ld, js: js, hint: hint, videos: videos)
                       var withLinks = movie
                       withLinks.externalLinks = externals.map(\.link)
+                      for l in serviceLinksInText(html) where !withLinks.externalLinks.contains(where: { $0.url == l.url }) {
+                          withLinks.externalLinks.append(l)
+                      }
                       pageEntries[pageKey] = PageEntry(movie: withLinks, strong: strong)
                       pageOrder.append(pageKey)
                       for u in redirects + jumps + iframes + playLinks.map(\.url) + jsPlay {
@@ -5931,6 +6082,11 @@ jobs:
               @Published private(set) var captured: [URL] = []
 
               var onVideo: ((URL, [HTTPCookie], [String: String]) -> Void)?
+              /// FebBox's site, and the only kind of FebBox address the page may move to on its own.
+              var serviceHost: NSRegularExpression?
+              var lockPattern: NSRegularExpression?
+              /// While signing in, FebBox pages may move freely.
+              private var freeBrowsingUntil = Date.distantPast
               private var observations: [NSKeyValueObservation] = []
               private var lastHandOff: (URL, Date)?
 
@@ -6028,6 +6184,14 @@ jobs:
               }
 
               func load(_ url: URL) {
+                  freeBrowsingUntil = .distantPast
+                  webView.load(URLRequest(url: url))
+              }
+
+              /// For signing in: lets FebBox move between its own pages for 10 minutes.
+              func loadForSignIn(_ url: URL) {
+                  freeBrowsingUntil = Date().addingTimeInterval(600)
+                  notice = "Sign in, then tap ⋯ → Back to the Share Page."
                   webView.load(URLRequest(url: url))
               }
 
@@ -6083,6 +6247,19 @@ jobs:
               func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction) async -> WKNavigationActionPolicy {
                   if let url = navigationAction.request.url, Self.videoExts.contains(url.pathExtension.lowercased()) {
                       Task { await handOff(url) }
+                      return .cancel
+                  }
+                  // Stay on the share page: refuse FebBox redirects to any other FebBox address.
+                  if let url = navigationAction.request.url,
+                     navigationAction.targetFrame?.isMainFrame ?? true,
+                     Date() > freeBrowsingUntil,
+                     let lock = lockPattern,
+                     let host = url.host?.lowercased(), Scraper.matches(serviceHost, host),
+                     !Scraper.matches(lock, url.absoluteString),
+                     navigationAction.navigationType != .linkActivated,
+                     navigationAction.navigationType != .formSubmitted {
+                      DiagLog.shared.log("web", "Refused redirect to \(url.absoluteString) (not a share page)")
+                      notice = "FebBox tried to send you to \(url.path.isEmpty ? url.absoluteString : url.path). CineScout stayed on the share page. If you need to sign in, tap ⋯ → Sign In to FebBox."
                       return .cancel
                   }
                   return .allow
@@ -6201,6 +6378,10 @@ jobs:
                           ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
                           ToolbarItem(placement: .primaryAction) {
                               Menu {
+                                  Button { model.load(session.link.url) } label: { Label("Back to the Share Page", systemImage: "arrow.uturn.backward") }
+                                  Button {
+                                      if let host = session.link.url.host, let home = URL(string: "https://\(host)") { model.loadForSignIn(home) }
+                                  } label: { Label("Sign In to \(session.link.service)", systemImage: "person.crop.circle") }
                                   Button { model.webView.reload() } label: { Label("Reload", systemImage: "arrow.clockwise") }
                                   Button { openURL(session.link.url) } label: {
                                       Label("Open in \(session.link.service) App or Safari", systemImage: "arrow.up.forward.app")
@@ -6219,6 +6400,10 @@ jobs:
                           preparing = PrepareJob(movie: session.movie, url: url, cookies: cookies, headers: headers)
                       }
                       if model.webView.url == nil {
+                          if let svc = Rules.load().externalServices?.first(where: { $0.name == session.link.service }) {
+                              model.serviceHost = Scraper.regex(svc.hostPattern, name: "hostPattern")
+                              model.lockPattern = Scraper.regex(svc.acceptPattern, name: "acceptPattern")
+                          }
                           if let pattern = Rules.load().externalServices?.first(where: { $0.name == session.link.service })?.highlightPattern,
                              !pattern.isEmpty {
                               model.installHighlighter(pattern: pattern)
