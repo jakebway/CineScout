@@ -57,6 +57,7 @@ jobs:
                     NSAllowsArbitraryLoads: true
                     NSAllowsLocalNetworking: true
                   NSLocalNetworkUsageDescription: CineScout connects to your media site on your local network.
+                  NSPhotoLibraryAddUsageDescription: CineScout saves the movies you choose to Photos as small 1080p videos.
                   UIBackgroundModes: [audio, fetch, processing]
                   BGTaskSchedulerPermittedIdentifiers: [com.jakebway.cinescout.refresh]
                   LSApplicationQueriesSchemes: [vlc-x-callback, infuse]
@@ -141,7 +142,7 @@ jobs:
                   CrashWatch.install()
                   WorkFolder.cleanAll()
                   BackgroundWork.register()
-                  URLCache.shared = URLCache(memoryCapacity: 64 * 1024 * 1024, diskCapacity: 400 * 1024 * 1024)
+                  URLCache.shared = URLCache(memoryCapacity: 64 * 1024 * 1024, diskCapacity: 500 * 1024 * 1024)
                   try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
                   if UserDefaults.standard.bool(forKey: "sessionOpen") {
                       DiagLog.shared.log("app", "The previous session ended while the app was open (crash or killed by iOS).")
@@ -152,6 +153,7 @@ jobs:
               var body: some Scene {
                   WindowGroup {
                       RootView()
+                          .task { WebWarmup.start() }
                           .environmentObject(store)
                           .preferredColorScheme(.dark)
                           .tint(.orange)
@@ -196,11 +198,7 @@ jobs:
                               .padding(12)
                       }
                       if let url = movie.posterURL {
-                          AsyncImage(url: url, transaction: Transaction(animation: .easeOut(duration: 0.25))) { phase in
-                              if let image = phase.image {
-                                  image.resizable().scaledToFill()
-                              }
-                          }
+                          CachedArt(url: url, maxPixel: showTitle ? 600 : 1200)
                       }
                   }
               }
@@ -250,7 +248,11 @@ jobs:
 
               func body(content: Content) -> some View {
                   content
-                      .onAppear { store.prefetch(movie) }
+                      .onAppear {
+                          store.prefetch(movie)
+                          // Posters a little further along the row/grid, so they're there before you scroll to them.
+                          ImagePipeline.shared.prefetch(store.neighbors(of: movie.id).compactMap(\.posterURL))
+                      }
                       .onDisappear { store.cancelPrefetch(movie) }
               }
           }
@@ -771,6 +773,12 @@ jobs:
                       store.pumpRemovals()
                       let n = (UserDefaults.standard.array(forKey: "febboxPendingRemovals") as? [[String]])?.count ?? 0
                       return ("Removing \(n) finished item(s) from your FebBox collaborative files.", true)
+                  case "probestream":
+                      return (VideoSaver.shared.probeLast(), true)
+                  case "streamformat":
+                      return (StreamProbe.lastText() ?? "No stream checked yet. Play a movie, then run probeStream.", true)
+                  case "savelast":
+                      return (VideoSaver.shared.saveLast(), true)
                   case "help":
                       return (Self.help, true)
                   default:
@@ -780,7 +788,7 @@ jobs:
 
               static let help = """
               Paste what Claude sends you and tap Run.
-              Commands: rescan, lookUpAll, clearLibrary, resetRules, clearLog, verboseOn, verboseOff, removeNow
+              Commands: rescan, lookUpAll, clearLibrary, resetRules, clearLog, verboseOn, verboseOff, removeNow, probeStream, streamFormat, saveLast
               Script: cinescout.movies(), cinescout.editMovie(id, {title, year, overview, poster}), cinescout.removeMovie(id), cinescout.rules(), cinescout.setRules({...}), cinescout.setSetting(key, value), cinescout.run("rescan"), cinescout.log(text)
               """
 
@@ -981,6 +989,7 @@ jobs:
               @Environment(\.openURL) private var openURL
               @State private var expanded = false
               @State private var alertText: String?
+              @ObservedObject private var saver = VideoSaver.shared
 
               /// Always show the latest copy (a rescan may have updated it).
               private var m: Movie { store.movie(movie.id) ?? movie }
@@ -1016,7 +1025,12 @@ jobs:
                   .ignoresSafeArea(edges: .top)
                   .toolbarBackground(.hidden, for: .navigationBar)
                   .navigationBarTitleDisplayMode(.inline)
-                  .task { _ = await store.lookUpNow(movie) }
+                  .task {
+                      _ = await store.lookUpNow(movie)
+                      // Get the stream ready while you read, so Play starts at once.
+                      store.warmUp(store.movie(movie.id) ?? movie)
+                  }
+                  .onDisappear { store.coolDown(movie) }
                   .alert("Can't open that", isPresented: Binding(get: { alertText != nil }, set: { if !$0 { alertText = nil } })) {
                       Button("OK", role: .cancel) {}
                   } message: {
@@ -1091,6 +1105,14 @@ jobs:
                               CircleAction(title: watched ? "Watched" : "Mark Watched", systemImage: watched ? "checkmark.circle.fill" : "checkmark.circle")
                           }
                           .accessibilityLabel(watched ? "Watched. Tap to mark as not watched." : "Mark as watched")
+                          Button {
+                              UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                              Task { await store.saveToPhotos(m) }
+                          } label: {
+                              CircleAction(title: saver.isBusy ? "Saving…" : "Save to Photos", systemImage: "arrow.down.to.line.circle")
+                          }
+                          .disabled(saver.isBusy)
+                          .accessibilityLabel("Save a 1080p copy to Photos")
                           if let video = m.bestVideo(canPlayAnything: PlaybackSupport.vlc) {
                               ForEach(ExternalPlayer.allCases) { player in
                                   Button { open(player.url(for: video), missing: player.missingMessage) } label: {
@@ -1326,6 +1348,11 @@ jobs:
                       }
                   }
 
+                  s += "\n===== Last stream format =====\n"
+                  s += StreamProbe.lastText() ?? "No stream checked yet (play a movie first).\n"
+                  s += "Save settings: maxHeight \(Rules.load().resolved.saveMaxHeight ?? 1080), methods \(Rules.load().resolved.saveMethods ?? []), presets \(Rules.load().resolved.savePresets ?? ["automatic"]), saveScript \(Rules.load().resolved.saveScript?.isEmpty == false ? "set" : "none")\n"
+                  s += "Save status: \(String(describing: VideoSaver.shared.stage))\n"
+
                   s += "\n===== Log (oldest first) =====\n"
                   s += String(DiagLog.shared.contents().suffix(400_000))
 
@@ -1528,13 +1555,63 @@ jobs:
                   case failed(String)
               }
 
-              @Published private(set) var movies: [Movie] = []
+              @Published private(set) var movies: [Movie] = [] { didSet { derived = nil } }
+              /// Lists the screens ask for over and over (shelves, genres, lookups by id), worked out once
+              /// per library change instead of on every redraw.
+              private var derived: Derived?
+              private struct Derived {
+                  var index: [String: Int]
+                  var featured: [Movie]
+                  var recentlyAdded: [Movie]
+                  var genreShelves: [GenreShelf]
+                  var allGenres: [String]
+              }
+              private var d: Derived {
+                  if let derived { return derived }
+                  var index: [String: Int] = [:]
+                  index.reserveCapacity(movies.count)
+                  for (i, m) in movies.enumerated() where index[m.id] == nil { index[m.id] = i }
+                  let withArt = movies.filter { $0.posterURL != nil }
+                  let pool = withArt.count >= 3 ? withArt : movies
+                  let featured = Array(pool.sorted { a, b in
+                      let ra = (a.overview == nil ? 0 : 1), rb = (b.overview == nil ? 0 : 1)
+                      return ra != rb ? ra > rb : a.addedAt > b.addedAt
+                  }.prefix(6))
+                  let recent = Array(movies.sorted { $0.addedAt > $1.addedAt }.prefix(20))
+                  var groups: [String: [Movie]] = [:]
+                  for m in movies { for g in m.genres { groups[g, default: []].append(m) } }
+                  let shelves = groups
+                      .filter { $0.value.count >= 3 }
+                      .sorted { $0.value.count > $1.value.count }
+                      .prefix(8)
+                      .map { GenreShelf(name: $0.key, movies: $0.value) }
+                  let x = Derived(index: index, featured: featured, recentlyAdded: recent,
+                                  genreShelves: Array(shelves), allGenres: groups.keys.sorted())
+                  derived = x
+                  return x
+              }
+
+              /// The movies right after this one (for loading their posters early).
+              func neighbors(of id: String, count: Int = 10) -> [Movie] {
+                  guard let i = d.index[id] else { return [] }
+                  let end = min(movies.count, i + 1 + count)
+                  return i + 1 < end ? Array(movies[(i + 1)..<end]) : []
+              }
               @Published private(set) var sites: [Site] = []
               @Published private(set) var progress: [String: WatchProgress] = [:]
               /// Everything you've watched (or started), newest first, kept after you finish.
               @Published private(set) var history: [String: WatchEntry] = [:]
               @Published var scanState: ScanState = .idle
-              @Published var nowPlaying: PlayRequest?
+              @Published var nowPlaying: PlayRequest? {
+                  // Background work waits while you watch, then picks up again.
+                  didSet {
+                      if nowPlaying == nil && oldValue != nil { pumpWarm(); pumpRobot() }
+                      // Remember what's playing (Save to Photos, Console checks) and record its format for the report.
+                      if let r = nowPlaying, !r.url.isFileURL, r.id != oldValue?.id {
+                          VideoSaver.shared.remember(title: r.movie.title, url: r.url, cookies: r.cookies, headers: r.headers)
+                      }
+                  }
+              }
               @Published var webSession: WebSession?
               /// A plain-English message shown as an alert.
               @Published var alertMessage: String?
@@ -1579,25 +1656,16 @@ jobs:
 
               // MARK: Lookups for the screens
 
-              func movie(_ id: String) -> Movie? { movies.first { $0.id == id } }
-
-              func movies(_ ids: [String]) -> [Movie] {
-                  let byID = Dictionary(movies.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
-                  return ids.compactMap { byID[$0] }
+              func movie(_ id: String) -> Movie? {
+                  guard let i = d.index[id], i < movies.count else { return nil }
+                  return movies[i]
               }
 
-              var featured: [Movie] {
-                  let withArt = movies.filter { $0.posterURL != nil }
-                  let pool = withArt.count >= 3 ? withArt : movies
-                  return Array(pool.sorted { a, b in
-                      let ra = (a.overview == nil ? 0 : 1), rb = (b.overview == nil ? 0 : 1)
-                      return ra != rb ? ra > rb : a.addedAt > b.addedAt
-                  }.prefix(6))
-              }
+              func movies(_ ids: [String]) -> [Movie] { ids.compactMap { movie($0) } }
 
-              var recentlyAdded: [Movie] {
-                  Array(movies.sorted { $0.addedAt > $1.addedAt }.prefix(20))
-              }
+              var featured: [Movie] { d.featured }
+
+              var recentlyAdded: [Movie] { d.recentlyAdded }
 
               /// Movies you've watched or started, most recent first.
               var recentlyWatched: [Movie] {
@@ -1629,8 +1697,11 @@ jobs:
               }
 
               private func saveWatchData() {
-                  if let data = try? JSONEncoder().encode(progress) { try? data.write(to: progressURL, options: .atomic) }
-                  if let data = try? JSONEncoder().encode(history) { try? data.write(to: historyURL, options: .atomic) }
+                  let p = progress, h = history, pu = progressURL, hu = historyURL
+                  Task.detached(priority: .utility) {
+                      if let data = try? JSONEncoder().encode(p) { try? data.write(to: pu, options: .atomic) }
+                      if let data = try? JSONEncoder().encode(h) { try? data.write(to: hu, options: .atomic) }
+                  }
               }
 
               var continueWatching: [Movie] {
@@ -1644,19 +1715,9 @@ jobs:
                   var id: String { name }
               }
 
-              var genreShelves: [GenreShelf] {
-                  var groups: [String: [Movie]] = [:]
-                  for m in movies { for g in m.genres { groups[g, default: []].append(m) } }
-                  return groups
-                      .filter { $0.value.count >= 3 }
-                      .sorted { $0.value.count > $1.value.count }
-                      .prefix(8)
-                      .map { GenreShelf(name: $0.key, movies: $0.value) }
-              }
+              var genreShelves: [GenreShelf] { d.genreShelves }
 
-              var allGenres: [String] {
-                  Array(Set(movies.flatMap(\.genres))).sorted()
-              }
+              var allGenres: [String] { d.allGenres }
 
               func moreLike(_ movie: Movie) -> [Movie] {
                   let g = Set(movie.genres)
@@ -1808,6 +1869,23 @@ jobs:
                   var m = movie(given.id) ?? given
                   if m.hasVideo { play(m); return }
 
+                  // Found ahead of time? Start right away.
+                  if let w = warm[m.id], w.fresh {
+                      DiagLog.shared.log("speed", "Playing “\(m.title)” from the stream found ahead of time.")
+                      startStream(w, for: m)
+                      return
+                  }
+                  // Being found right now in the background? Wait for that instead of starting over.
+                  if warming == m.id {
+                      robotStatus = "Getting the video ready…"
+                      if let w = await waitForWarm(m.id) {
+                          robotStatus = nil
+                          startStream(w, for: m)
+                          return
+                      }
+                      robotStatus = nil
+                  }
+
                   if m.needsLookup {
                       robotStatus = "Looking for the video…"
                       if let r = await lookUpNow(m) { m = r }
@@ -1841,6 +1919,7 @@ jobs:
                   if let video = result.videos.first {
                       let rules = Rules.load().resolved
                       let names = result.names
+                      warm[m.id] = WarmStream(url: video, cookies: result.cookies, headers: result.headers, names: names)
                       if rules.febboxStreamPreview ?? true {
                           // Play FebBox's own preview stream directly: nothing is downloaded.
                           var req = request(for: m, url: video, cookies: result.cookies, headers: result.headers)
@@ -1858,6 +1937,109 @@ jobs:
                   } else {
                       alertMessage = "CineScout opened “\(m.title)” and clicked through, but didn't reach a FebBox share page. Send Claude a report from Settings so it can be fixed with a paste."
                   }
+              }
+
+              // MARK: Getting streams ready before you press Play
+
+              /// Streams found ahead of time, by movie id.
+              private var warm: [String: WarmStream] = [:]
+              private var warming: String?
+              private var warmQueue: [String] = []
+              private var warmRobot: BrowserRobot?
+              private var warmWaiters: [String: [CheckedContinuation<WarmStream?, Never>]] = [:]
+
+              private func startStream(_ w: WarmStream, for m: Movie) {
+                  PreloadedAssets.put(w.asset)
+                  var req = request(for: m, url: w.url, cookies: w.cookies, headers: w.headers)
+                  req.febboxNames = w.names
+                  nowPlaying = req
+              }
+
+              /// The stream for a movie: ready-made if we have it, otherwise found now (with the overlay).
+              func stream(for m: Movie) async -> WarmStream? {
+                  if let w = warm[m.id], w.fresh { return w }
+                  if warming == m.id { return await waitForWarm(m.id) }
+                  let svc = Rules.load().externalServices?.first
+                  let share = m.externalLinks.first { l in svc.map { $0.accepts($0.canonical(l.url)) } ?? true }?.url
+                  guard share != nil || m.pageURL != nil, robot == nil else { return nil }
+                  robotStatus = "Finding the video…"
+                  let r = BrowserRobot(rules: Rules.load()) { [weak self] text in self?.robotStatus = text }
+                  robot = r
+                  let result = await r.run(page: m.pageURL, share: share, title: m.title)
+                  robot = nil
+                  robotStatus = nil
+                  if let s = result.share { remember(share: s, for: m.id, service: svc?.name ?? "FebBox") }
+                  guard let v = result.videos.first else {
+                      if result.needsSignIn { alertMessage = "Sign in to FebBox first: Settings → Sign In to FebBox." }
+                      return nil
+                  }
+                  let w = WarmStream(url: v, cookies: result.cookies, headers: result.headers, names: result.names)
+                  warm[m.id] = w
+                  return w
+              }
+
+              /// Quietly find a movie's stream now (you opened it, or it's next in Continue Watching).
+              func warmUp(_ m: Movie) {
+                  guard Rules.load().resolved.febboxSharePlay ?? true, !m.hasVideo,
+                        warm[m.id]?.fresh != true, warming != m.id, !warmQueue.contains(m.id) else { return }
+                  let svc = Rules.load().externalServices?.first
+                  guard m.externalLinks.contains(where: { l in svc.map { $0.accepts($0.canonical(l.url)) } ?? true }) || m.pageURL != nil else { return }
+                  warmQueue.insert(m.id, at: 0)
+                  if warmQueue.count > 4 { warmQueue.removeLast(warmQueue.count - 4) }
+                  pumpWarm()
+              }
+
+              /// You left the movie's page before it was ready: drop it from the line.
+              func coolDown(_ m: Movie) { warmQueue.removeAll { $0 == m.id } }
+
+              private func pumpWarm() {
+                  guard warmRobot == nil, robot == nil, nowPlaying == nil, !warmQueue.isEmpty else { return }
+                  let id = warmQueue.removeFirst()
+                  guard let m = movie(id) else { pumpWarm(); return }
+                  let svc = Rules.load().externalServices?.first
+                  let share = m.externalLinks.first { l in svc.map { $0.accepts($0.canonical(l.url)) } ?? true }?.url
+                  warming = id
+                  let r = BrowserRobot(rules: Rules.load()) { _ in }
+                  warmRobot = r
+                  Task {
+                      let result = await r.run(page: m.pageURL, share: share, title: m.title)
+                      if let s = result.share { self.remember(share: s, for: id, service: svc?.name ?? "FebBox") }
+                      var w: WarmStream?
+                      if let v = result.videos.first {
+                          w = WarmStream(url: v, cookies: result.cookies, headers: result.headers, names: result.names)
+                          self.warm[id] = w
+                          DiagLog.shared.log("speed", "Ready ahead of time: “\(m.title)”.")
+                      }
+                      self.warmRobot = nil
+                      self.warming = nil
+                      for c in self.warmWaiters.removeValue(forKey: id) ?? [] { c.resume(returning: w) }
+                      self.pumpWarm()
+                  }
+              }
+
+              private func waitForWarm(_ id: String) async -> WarmStream? {
+                  await withCheckedContinuation { c in warmWaiters[id, default: []].append(c) }
+              }
+
+              /// At launch: get the first things you're likely to play ready.
+              func warmLikelyNext() {
+                  for m in continueWatching.prefix(2).reversed() { warmUp(m) }
+              }
+
+              // MARK: Save to Photos
+
+              /// Finds the movie's stream (if needed) and saves a small 1080p copy to your Photos.
+              func saveToPhotos(_ given: Movie) async {
+                  let m = movie(given.id) ?? given
+                  if let v = m.bestVideo(canPlayAnything: false) {
+                      VideoSaver.shared.save(title: m.title, url: v, cookies: [], headers: [:])
+                      return
+                  }
+                  guard let w = await stream(for: m) else {
+                      if alertMessage == nil { alertMessage = "CineScout couldn't find a video for “\(m.title)” to save." }
+                      return
+                  }
+                  VideoSaver.shared.save(title: m.title, url: w.url, cookies: w.cookies, headers: w.headers)
               }
 
               // MARK: Removing finished items from your FebBox collaborative files
@@ -2094,6 +2276,10 @@ jobs:
               func autoRefreshIfStale() {
                   removalFailuresThisSession = 0
                   pumpRemovals()
+                  Task {
+                      try? await Task.sleep(nanoseconds: 2_500_000_000)
+                      self.warmLikelyNext()
+                  }
                   guard !isScanning, !sites.isEmpty else { return }
                   let oldest = sites.map { $0.lastScanned ?? .distantPast }.min() ?? .distantPast
                   guard Date().timeIntervalSince(oldest) > 6 * 3600 else { return }
@@ -2381,9 +2567,12 @@ jobs:
                   cleanServiceLinks()
               }
 
+              /// Writes the library in the background, so the screen never waits on it.
               private func save() {
-                  if let data = try? JSONEncoder().encode(Saved(movies: movies, sites: sites)) {
-                      try? data.write(to: fileURL, options: .atomic)
+                  let snapshot = Saved(movies: movies, sites: sites)
+                  let url = fileURL
+                  Task.detached(priority: .utility) {
+                      if let data = try? JSONEncoder().encode(snapshot) { try? data.write(to: url, options: .atomic) }
                   }
               }
 
@@ -2434,6 +2623,7 @@ jobs:
                       }
                   }
                   .animation(.easeInOut(duration: 0.2), value: store.robotStatus)
+                  .overlay(alignment: .bottom) { SaveBanner().padding(.bottom, 58) }
                   .sheet(item: $store.webSession) { session in
                       WebBrowserView(session: session).environmentObject(store)
                   }
@@ -3840,7 +4030,8 @@ jobs:
                   var options: [String: Any] = [:]
                   if !request.cookies.isEmpty { options[AVURLAssetHTTPCookiesKey] = request.cookies }
                   if !request.headers.isEmpty { options["AVURLAssetHTTPHeaderFieldsKey"] = request.headers }
-                  let asset = AVURLAsset(url: request.url, options: options.isEmpty ? nil : options)
+                  // Loaded ahead of time when possible, so playback starts sooner.
+                  let asset = PreloadedAssets.take(request.url) ?? AVURLAsset(url: request.url, options: options.isEmpty ? nil : options)
                   let item = AVPlayerItem(asset: asset)
                   item.preferredForwardBufferDuration = 30
                   avPlayer.replaceCurrentItem(with: item)
@@ -4054,6 +4245,7 @@ jobs:
 
           struct PlayerScreen: View {
               @StateObject private var c: PlaybackController
+              @ObservedObject private var saver = VideoSaver.shared
               @Environment(\.dismiss) private var dismiss
               @Environment(\.openURL) private var openURL
               @State private var showControls = true
@@ -4181,6 +4373,7 @@ jobs:
                           Text(c.engine.rawValue).font(.caption2).foregroundStyle(.white.opacity(0.6))
                       }
                       Spacer()
+                      saveButton
                       AirPlayButton().frame(width: 36, height: 36)
                       if c.engine == .native && c.canPiP {
                           Button { c.togglePiP() } label: {
@@ -4189,6 +4382,33 @@ jobs:
                           .accessibilityLabel("Picture in Picture")
                       }
                       optionsMenu
+                  }
+              }
+
+              /// Saves a small 1080p copy of what's playing to Photos, in the background, while you keep watching.
+              @ViewBuilder private var saveButton: some View {
+                  switch saver.stage {
+                  case .downloading(let p), .converting(let p):
+                      ZStack {
+                          Circle().stroke(.white.opacity(0.25), lineWidth: 3)
+                          Circle().trim(from: 0, to: max(0.03, p)).stroke(.white, style: StrokeStyle(lineWidth: 3, lineCap: .round)).rotationEffect(.degrees(-90))
+                          Text("\(Int(p * 100))").font(.system(size: 10, weight: .bold))
+                      }
+                      .frame(width: 28, height: 28)
+                      .accessibilityLabel("Saving to Photos, \(Int(p * 100)) percent")
+                  case .saving:
+                      ProgressView().tint(.white).frame(width: 28, height: 28)
+                  case .done:
+                      Image(systemName: "checkmark.circle.fill").font(.title3).foregroundStyle(.green)
+                          .accessibilityLabel("Saved to Photos")
+                  default:
+                      Button {
+                          UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                          saver.save(title: c.request.movie.title, url: c.request.url, cookies: c.request.cookies, headers: c.request.headers)
+                      } label: {
+                          Image(systemName: "arrow.down.to.line.circle").font(.title3)
+                      }
+                      .accessibilityLabel("Save to Photos")
                   }
               }
 
@@ -4415,6 +4635,7 @@ jobs:
               private var sinceSave = 0
               private var reloads = 0
               private var lastFileProbe = -100
+              private var lastFileAt = Date.distantPast
               private var openedFolder: String?
               private var desktop = false
               static let desktopUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
@@ -4457,6 +4678,7 @@ jobs:
                   content.addUserScript(WKUserScript(source: popups, injectionTime: .atDocumentStart, forMainFrameOnly: false))
                   content.addUserScript(WKUserScript(source: WebModel.sniffer, injectionTime: .atDocumentStart, forMainFrameOnly: false))
                   let handler = RobotMessageHandler(self)
+                  RobotBlocker.apply(to: content)
                   content.add(handler, name: "robot")
                   content.add(handler, name: "cinescout")
                   webView.navigationDelegate = self
@@ -4548,10 +4770,11 @@ jobs:
                       self.finish()
                   }
                   loop = Task { [weak self] in
-                      try? await Task.sleep(nanoseconds: 1_500_000_000)
+                      try? await Task.sleep(nanoseconds: 700_000_000)
                       while let self, !self.finished, !Task.isCancelled {
                           await self.probe()
-                          try? await Task.sleep(nanoseconds: 1_200_000_000)
+                          // Check often while the page is changing, less often while waiting on a stream.
+                          try? await Task.sleep(nanoseconds: self.webView.isLoading ? 400_000_000 : 700_000_000)
                       }
                   }
                   await withCheckedContinuation { c in
@@ -4745,7 +4968,7 @@ jobs:
                       if (s) return JSON.stringify({ clicked: s, kind: 'file', names, title });
                     }
                     return JSON.stringify({ names, title });
-                  })(\(fileNamesJSON), \(clickedJSON), \(probes - lastFileProbe < 9))
+                  })(\(fileNamesJSON), \(clickedJSON), \(Date().timeIntervalSince(lastFileAt) < 10))
                   """)
                   collectNames(out)
                   if let list = out["videos"] as? [String] {
@@ -4757,6 +4980,7 @@ jobs:
                       switch out["kind"] as? String {
                       case "file":
                           lastFileProbe = probes
+                          lastFileAt = Date()
                           DiagLog.shared.log("robot", "Opened the file “\(label(c))” on the share page.")
                           say("Opening “\(label(c))”…")
                           Task { [weak self] in
@@ -5508,8 +5732,24 @@ jobs:
               var notMovieURLPattern: String?
               var notMovieTitlePattern: String?
 
+              // Save to Photos (all changeable from the Console)
+              /// Tallest version of the stream to save (1080 = 1080p).
+              var saveMaxHeight: Int?
+              /// Ways to fetch an HLS stream, tried in order: "join" (join the pieces into one MP4) and "apple" (iPhone's own downloader).
+              var saveMethods: [String]?
+              /// Export presets tried in order (e.g. "AVAssetExportPresetHEVC1920x1080"). Empty = automatic.
+              var savePresets: [String]?
+              /// Extra headers sent with every save request.
+              var saveHeaders: [String: String]?
+              /// Free space needed before saving, in GB.
+              var saveMinFreeGB: Double?
+              /// How many pieces to fetch at once.
+              var saveBatch: Int?
+              /// Optional JavaScript: function planSave(info) { return {mediaURL, init, segments, method, headers} } to override how a stream is saved.
+              var saveScript: String?
+
               static let defaults = Rules(
-                  version: 17,
+                  version: 18,
                   note: "CineScout scanner rules. Claude can send you a new version of this file: paste it in Diagnostics → Scanner rules, save, then rescan. Optional `script` is JavaScript defining extract(html, url) that returns {title, year, overview, poster, videos: [], playLinks: [], links: [], isMovie}; call log(text) to write to the diagnostic log.",
                   playLabelPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:play|watch|stream|view online|start watching|resume|download|direct link|mirror|server)\b|\b(?:2160p|1080p|720p|480p|4k|full movie)\b|^\s*[▶►⏵]"#,
                   genericLabelPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:play|play now|watch|watch now|watch online|watch movie|watch free|stream|stream now|view|download|download now|direct link|link|here|click here|more|more info|info|details|trailer|open|start|resume|next|previous|prev|back|home|menu|login|log in|sign in|register|search|parent directory|\.\./?|name|last modified|size|description|(?:server|mirror|source|part|episode|ep|season|page)\s*#?\d*|\d{3,4}p|4k|uhd|hd|sd|mp4|mkv|m3u8|open in \S+(?: app)?|»|«|›|‹|\d{1,2})\s*$"#,
@@ -5563,7 +5803,11 @@ jobs:
                   febboxDesktopPreview: true,
                   febboxSharePlay: true,
                   notMovieURLPattern: #"(?i)/(?:ads?|adverts?|advertis\w*|sponsor\w*|promo\w*|banners?|affiliates?|partners?|redirect|out|go|click|track\w*|vpn|casino|bet\w*|download|downloads|apps?|app-download|about|faq|help|contact|login|register|signup|account|privacy|terms|dmca|blog|news|tags?|genres?|category|categories|country|search|actors?|person|people|cast|donate|premium|vip|subscribe|pricing)(?:[/?#]|$)|doubleclick|googlesyndication|adservice|popads|propeller"#,
-                  notMovieTitlePattern: #"(?i)^\s*(?:(?:android|ios|iphone|ipad|windows|mac|tv)\s+app|apps?|download(?:\s+(?:the\s+)?app)?|get the app|install.*|home|faq|help|contact(?: us)?|about(?: us)?|log ?in|sign ?in|register|sign ?up|dmca|privacy(?: policy)?|terms.*|untitled|advertisement|sponsored|ad|ads|promo.*|donate|go premium|get vip.*|subscribe.*|join (?:our|us).*)\s*$|\b(?:vpn|online casino|sports ?betting|telegram channel|discord server|click here|limited offer|\d+% off)\b"#
+                  notMovieTitlePattern: #"(?i)^\s*(?:(?:android|ios|iphone|ipad|windows|mac|tv)\s+app|apps?|download(?:\s+(?:the\s+)?app)?|get the app|install.*|home|faq|help|contact(?: us)?|about(?: us)?|log ?in|sign ?in|register|sign ?up|dmca|privacy(?: policy)?|terms.*|untitled|advertisement|sponsored|ad|ads|promo.*|donate|go premium|get vip.*|subscribe.*|join (?:our|us).*)\s*$|\b(?:vpn|online casino|sports ?betting|telegram channel|discord server|click here|limited offer|\d+% off)\b"#,
+                  saveMaxHeight: 1080,
+                  saveMethods: ["join", "apple"],
+                  saveMinFreeGB: 3,
+                  saveBatch: 6
               )
 
               /// These rules with built-in defaults filled in for anything missing.
@@ -5613,7 +5857,14 @@ jobs:
                       febboxDesktopPreview: febboxDesktopPreview ?? d.febboxDesktopPreview,
                       febboxSharePlay: febboxSharePlay ?? d.febboxSharePlay,
                       notMovieURLPattern: notMovieURLPattern ?? d.notMovieURLPattern,
-                      notMovieTitlePattern: notMovieTitlePattern ?? d.notMovieTitlePattern
+                      notMovieTitlePattern: notMovieTitlePattern ?? d.notMovieTitlePattern,
+                      saveMaxHeight: saveMaxHeight ?? d.saveMaxHeight,
+                      saveMethods: saveMethods ?? d.saveMethods,
+                      savePresets: savePresets ?? d.savePresets,
+                      saveHeaders: saveHeaders ?? d.saveHeaders,
+                      saveMinFreeGB: saveMinFreeGB ?? d.saveMinFreeGB,
+                      saveBatch: saveBatch ?? d.saveBatch,
+                      saveScript: saveScript ?? d.saveScript
                   )
               }
 
@@ -5636,7 +5887,23 @@ jobs:
 
               /// Rules to scan with. Creates rules.json the first time, and refreshes it when it
               /// still holds an older app's untouched defaults.
+              /// The last rules read, reused until rules.json changes (it's read constantly, so this matters).
+              private static var cache: (stamp: Date, rules: Rules)?
+              private static let cacheLock = NSLock()
+
               static func load() -> Rules {
+                  let stamp = (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.modificationDate] as? Date) ?? nil
+                  cacheLock.lock()
+                  if let stamp, let c = cache, c.stamp == stamp { cacheLock.unlock(); return c.rules }
+                  cacheLock.unlock()
+                  let fresh = loadFromDisk()
+                  if let after = (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.modificationDate] as? Date) ?? nil {
+                      cacheLock.lock(); cache = (after, fresh); cacheLock.unlock()
+                  }
+                  return fresh
+              }
+
+              private static func loadFromDisk() -> Rules {
                   let fm = FileManager.default
                   let ud = UserDefaults.standard
                   if !fm.fileExists(atPath: fileURL.path) {
@@ -5741,6 +6008,675 @@ jobs:
                       }
                   }
                   return (r, nil)
+              }
+          }
+          CINESCOUT_EOF
+
+          # ---- SaveToPhotos.swift
+          cat > 'CineScout/Sources/SaveToPhotos.swift' <<'CINESCOUT_EOF'
+          import Foundation
+          import AVFoundation
+          import Photos
+          import SwiftUI
+          import UIKit
+          import JavaScriptCore
+
+          /// Saves a movie's stream to your Photos as a small 1080p .mp4.
+          /// FebBox's preview streams come in small pieces (HLS); they're fetched, joined, shrunk to 1080p and
+          /// handed to Photos. Plain video files are downloaded and shrunk the same way. Temporary files are
+          /// deleted as soon as Photos has the video.
+          @MainActor
+          final class VideoSaver: NSObject, ObservableObject {
+              static let shared = VideoSaver()
+
+              enum Stage: Equatable {
+                  case idle
+                  case downloading(Double)
+                  case converting(Double)
+                  case saving
+                  case done(String)
+                  case failed(String)
+              }
+
+              @Published private(set) var stage: Stage = .idle
+              @Published private(set) var title = ""
+              private var job: Task<Void, Never>?
+              private var bgTask: UIBackgroundTaskIdentifier = .invalid
+              private var hlsContinuation: CheckedContinuation<URL, Error>?
+              private var hlsLocation: URL?
+              private var hlsTask: AVAssetDownloadTask?
+
+              var isBusy: Bool {
+                  switch stage {
+                  case .downloading, .converting, .saving: return true
+                  default: return false
+                  }
+              }
+
+              private struct Problem: LocalizedError {
+                  let message: String
+                  var errorDescription: String? { message }
+              }
+
+              // MARK: Start / stop
+
+              func save(title: String, url: URL, cookies: [HTTPCookie], headers: [String: String]) {
+                  guard !isBusy else {
+                      stage = .failed("Already saving “\(self.title)”. Wait for it to finish, then try again.")
+                      return
+                  }
+                  self.title = title
+                  stage = .downloading(0)
+                  DiagLog.shared.log("save", "Saving “\(title)” to Photos from \(url.absoluteString)")
+                  bgTask = UIApplication.shared.beginBackgroundTask(withName: "Save to Photos") { [weak self] in
+                      Task { @MainActor in self?.endBackground() }
+                  }
+                  job = Task {
+                      let work = FileManager.default.temporaryDirectory.appendingPathComponent("save-\(UUID().uuidString)", isDirectory: true)
+                      try? FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+                      defer { try? FileManager.default.removeItem(at: work) }
+                      do {
+                          try Self.checkSpace()
+                          let file = try await produce(url: url, cookies: cookies, headers: headers, in: work)
+                          try Task.checkCancellation()
+                          stage = .saving
+                          try await Self.addToPhotos(file)
+                          let size = (try? FileManager.default.attributesOfItem(atPath: file.path)[.size] as? Int64) ?? 0
+                          DiagLog.shared.log("save", "Saved “\(title)” to Photos (\(MediaPipeline.bytes(size))).")
+                          stage = .done("“\(title)” is in your Photos.")
+                          UINotificationFeedbackGenerator().notificationOccurred(.success)
+                          try? await Task.sleep(nanoseconds: 5_000_000_000)
+                          if case .done = stage { stage = .idle }
+                      } catch is CancellationError {
+                          stage = .idle
+                      } catch let error where Task.isCancelled || (error as? URLError)?.code == .cancelled {
+                          _ = error
+                          stage = .idle
+                      } catch {
+                          DiagLog.shared.log("save", "Saving “\(title)” failed: \(error.localizedDescription)")
+                          stage = .failed(error.localizedDescription)
+                          UINotificationFeedbackGenerator().notificationOccurred(.error)
+                      }
+                      endBackground()
+                  }
+              }
+
+              func cancel() {
+                  job?.cancel()
+                  fileTask?.cancel()
+                  hlsTask?.cancel()
+                  hlsContinuation?.resume(throwing: CancellationError())
+                  hlsContinuation = nil
+                  stage = .idle
+                  endBackground()
+                  DiagLog.shared.log("save", "Saving “\(title)” cancelled.")
+              }
+
+              func dismiss() { if !isBusy { stage = .idle } }
+
+              /// The last stream you played, so the Console can check or save it again.
+              private(set) var last: (title: String, url: URL, cookies: [HTTPCookie], headers: [String: String])?
+
+              func remember(title: String, url: URL, cookies: [HTTPCookie], headers: [String: String]) {
+                  last = (title, url, cookies, headers)
+                  var h = headers
+                  for (k, v) in HTTPCookie.requestHeaderFields(with: cookies) where h[k] == nil { h[k] = v }
+                  Task.detached(priority: .utility) { await StreamProbe.run(url, headers: h, note: "played “\(title)”") }
+              }
+
+              func saveLast() -> String {
+                  guard let l = last else { return "Nothing has played yet. Play a movie first, then run saveLast." }
+                  save(title: l.title, url: l.url, cookies: l.cookies, headers: l.headers)
+                  return "Saving “\(l.title)” again with the current rules."
+              }
+
+              func probeLast() -> String {
+                  guard let l = last else { return "Nothing has played yet. Play a movie first, then run probeStream." }
+                  var h = l.headers
+                  for (k, v) in HTTPCookie.requestHeaderFields(with: l.cookies) where h[k] == nil { h[k] = v }
+                  Task.detached(priority: .utility) { await StreamProbe.run(l.url, headers: h, note: "Console check") }
+                  return "Checking the stream of “\(l.title)”… run streamFormat in a few seconds to see the result."
+              }
+
+              private func endBackground() {
+                  if bgTask != .invalid { UIApplication.shared.endBackgroundTask(bgTask) }
+                  bgTask = .invalid
+              }
+
+              // MARK: Getting a file
+
+              private func produce(url: URL, cookies: [HTTPCookie], headers: [String: String], in work: URL) async throws -> URL {
+                  if url.isFileURL { return try await convert(url, in: work) }
+                  var h = headers
+                  for (k, v) in HTTPCookie.requestHeaderFields(with: cookies) where h[k] == nil { h[k] = v }
+                  for (k, v) in Rules.load().resolved.saveHeaders ?? [:] { h[k] = v }
+                  // Record what this stream looks like, for the report.
+                  Task.detached(priority: .utility) { await StreamProbe.run(url, headers: h, note: "save") }
+                  var isPlaylist = url.pathExtension.lowercased() == "m3u8"
+                  if !isPlaylist { isPlaylist = await Self.looksLikePlaylist(url, headers: h) }
+                  if isPlaylist { return try await fromHLS(url, headers: h, cookies: cookies, in: work) }
+                  let ext = url.pathExtension.lowercased()
+                  if ["mkv", "avi", "wmv", "flv", "webm"].contains(ext) {
+                      throw Problem(message: "This is a .\(ext) file, which iPhone can't turn into a Photos video. Saving works for FebBox's preview stream and for MP4/MOV files.")
+                  }
+                  let file = try await download(url, headers: h, to: work.appendingPathComponent("download.\(ext.isEmpty ? "mp4" : ext)"))
+                  return try await convert(file, in: work)
+              }
+
+              /// Peeks at the first bytes only (never downloads a whole movie just to check).
+              nonisolated private static func looksLikePlaylist(_ url: URL, headers: [String: String]) async -> Bool {
+                  var req = URLRequest(url: url, timeoutInterval: 20)
+                  for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
+                  req.setValue("bytes=0-511", forHTTPHeaderField: "Range")
+                  guard let (bytes, resp) = try? await URLSession.shared.bytes(for: req) else { return false }
+                  defer { bytes.task.cancel() }
+                  let type = (resp as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
+                  if type.contains("mpegurl") { return true }
+                  var head: [UInt8] = []
+                  do {
+                      for try await b in bytes {
+                          head.append(b)
+                          if head.count >= 7 { break }
+                      }
+                  } catch { return false }
+                  return String(decoding: head, as: UTF8.self).hasPrefix("#EXTM3U")
+              }
+
+              private var fileTask: URLSessionDownloadTask?
+
+              /// A plain video file, with progress.
+              private func download(_ url: URL, headers: [String: String], to dest: URL) async throws -> URL {
+                  var req = URLRequest(url: url, timeoutInterval: 60)
+                  for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
+                  return try await withCheckedThrowingContinuation { (c: CheckedContinuation<URL, Error>) in
+                      let t = URLSession.shared.downloadTask(with: req) { tmp, resp, err in
+                          if let err { c.resume(throwing: err); return }
+                          guard let tmp, ((resp as? HTTPURLResponse)?.statusCode ?? 200) < 400 else {
+                              c.resume(throwing: Problem(message: "The video link stopped working (it may have expired). Play the movie again, then tap Save."))
+                              return
+                          }
+                          do {
+                              try? FileManager.default.removeItem(at: dest)
+                              try FileManager.default.moveItem(at: tmp, to: dest)
+                              c.resume(returning: dest)
+                          } catch { c.resume(throwing: error) }
+                      }
+                      fileTask = t
+                      t.resume()
+                      Task { [weak self] in
+                          while t.state == .running || t.state == .suspended {
+                              try? await Task.sleep(nanoseconds: 400_000_000)
+                              if case .downloading = self?.stage { self?.stage = .downloading(t.progress.fractionCompleted) }
+                          }
+                      }
+                  }
+              }
+
+              // MARK: HLS (FebBox's preview stream)
+
+              private struct Variant { let uri: String; let height: Int; let bandwidth: Int }
+
+              private func fromHLS(_ master: URL, headers: [String: String], cookies: [HTTPCookie], in work: URL) async throws -> URL {
+                  let rules = Rules.load().resolved
+                  let maxHeight = rules.saveMaxHeight ?? 1080
+                  var headers = headers
+                  let masterText = try await Self.fetchText(master, headers: headers)
+                  var playlistURL = master
+                  var text = masterText
+                  if text.contains("#EXT-X-STREAM-INF") {
+                      let variants = Self.variants(text)
+                      // Closest to 1080p without going over; otherwise the smallest one above.
+                      let pick = variants.filter { $0.height > 0 && $0.height <= maxHeight }.max { ($0.height, $0.bandwidth) < ($1.height, $1.bandwidth) }
+                          ?? variants.min { $0.height < $1.height }
+                      guard let pick, let u = URL(string: pick.uri, relativeTo: master)?.absoluteURL else {
+                          throw Problem(message: "FebBox's stream didn't list any video quality CineScout could use.")
+                      }
+                      DiagLog.shared.log("save", "Using the \(pick.height > 0 ? "\(pick.height)p" : "default") version of the stream (\(variants.count) available).")
+                      playlistURL = u
+                      text = try await Self.fetchText(u, headers: headers)
+                  }
+                  let lines = text.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
+                  let encrypted = lines.contains { $0.hasPrefix("#EXT-X-KEY") && !$0.contains("METHOD=NONE") }
+                  var initURL = lines.first { $0.hasPrefix("#EXT-X-MAP") }.flatMap { Self.attribute("URI", in: $0) }
+                      .flatMap { URL(string: $0, relativeTo: playlistURL)?.absoluteURL }
+                  var segments = lines.filter { !$0.isEmpty && !$0.hasPrefix("#") }.compactMap { URL(string: $0, relativeTo: playlistURL)?.absoluteURL }
+                  var methods = rules.saveMethods ?? ["join", "apple"]
+
+                  // A fix from the Console can take over here: planSave(info) decides what to fetch and how.
+                  if let script = rules.saveScript, !script.isEmpty,
+                     let plan = Self.runPlan(script, info: ["url": master.absoluteString, "master": String(masterText.prefix(200_000)),
+                                                             "mediaURL": playlistURL.absoluteString, "media": String(text.prefix(400_000))]) {
+                      if let m = plan["mediaURL"] as? String, let u = URL(string: m), u != playlistURL {
+                          playlistURL = u
+                          text = try await Self.fetchText(u, headers: headers)
+                          segments = text.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
+                              .filter { !$0.isEmpty && !$0.hasPrefix("#") }.compactMap { URL(string: $0, relativeTo: u)?.absoluteURL }
+                      }
+                      if let i = plan["init"] as? String { initURL = i.isEmpty ? nil : URL(string: i, relativeTo: playlistURL)?.absoluteURL }
+                      if let list = plan["segments"] as? [String] { segments = list.compactMap { URL(string: $0, relativeTo: playlistURL)?.absoluteURL } }
+                      if let m = plan["method"] as? String { methods = [m] }
+                      if let extra = plan["headers"] as? [String: String] { for (k, v) in extra { headers[k] = v } }
+                      DiagLog.shared.log("save", "Using the Console's save plan: \(methods.joined(separator: ", ")), \(segments.count) pieces.")
+                  }
+                  guard !segments.isEmpty else { throw Problem(message: "FebBox's stream was empty. Play the movie again, then tap Save.") }
+                  DiagLog.shared.log("save", "Stream: \(segments.count) pieces, \(initURL != nil ? "fMP4" : "TS-style")\(encrypted ? ", encrypted" : ""). Trying: \(methods.joined(separator: " → ")).")
+
+                  var problems: [String] = []
+                  for method in methods {
+                      try Task.checkCancellation()
+                      do {
+                          switch method.lowercased() {
+                          case "join":
+                              // Modern pieces (fMP4): join them straight into one MP4.
+                              guard !encrypted else { problems.append("join: the pieces are encrypted"); continue }
+                              guard let initURL else { problems.append("join: pieces aren't fMP4 (no EXT-X-MAP)"); continue }
+                              let joined = work.appendingPathComponent("joined.mp4")
+                              try await join([initURL] + segments, headers: headers, into: joined)
+                              return try await convert(joined, in: work)
+                          case "joinraw":
+                              // Pieces that are already whole MP4/fMP4 chunks without a separate header.
+                              let joined = work.appendingPathComponent("joined.mp4")
+                              try await join((initURL.map { [$0] } ?? []) + segments, headers: headers, into: joined)
+                              return try await convert(joined, in: work)
+                          case "apple":
+                              // iPhone's own stream downloader (handles TS and protected pieces).
+                              let pkg = try await downloadWithAVFoundation(master, headers: headers, cookies: cookies, maxHeight: maxHeight)
+                              defer { try? FileManager.default.removeItem(at: pkg) }
+                              return try await convert(pkg, in: work)
+                          default:
+                              problems.append("\(method): unknown method")
+                          }
+                      } catch is CancellationError {
+                          throw CancellationError()
+                      } catch {
+                          problems.append("\(method): \(error.localizedDescription)")
+                          DiagLog.shared.log("save", "Method \(method) didn't work: \(error.localizedDescription)")
+                          stage = .downloading(0)
+                      }
+                  }
+                  throw Problem(message: "Couldn't save this stream (\(problems.joined(separator: "; "))). Send Claude a report from Settings; it can be fixed from the Console.")
+              }
+
+              /// Runs the Console-provided planSave(info) and returns its answer.
+              private static func runPlan(_ script: String, info: [String: String]) -> [String: Any]? {
+                  guard let ctx = JSContext() else { return nil }
+                  var failure: String?
+                  ctx.exceptionHandler = { _, e in failure = e?.toString() }
+                  ctx.evaluateScript(script)
+                  guard let fn = ctx.objectForKeyedSubscript("planSave"), !fn.isUndefined else {
+                      DiagLog.shared.log("save", "saveScript has no planSave(info) function\(failure.map { ": \($0)" } ?? "").")
+                      return nil
+                  }
+                  let out = fn.call(withArguments: [info])
+                  if let failure { DiagLog.shared.log("save", "saveScript error: \(failure)"); return nil }
+                  return out?.toDictionary() as? [String: Any]
+              }
+
+              private func join(_ parts: [URL], headers: [String: String], into file: URL) async throws {
+                  FileManager.default.createFile(atPath: file.path, contents: nil)
+                  let handle = try FileHandle(forWritingTo: file)
+                  defer { try? handle.close() }
+                  var done = 0
+                  let batch = max(1, min(Rules.load().resolved.saveBatch ?? 6, 16))
+                  var i = 0
+                  while i < parts.count {
+                      try Task.checkCancellation()
+                      let slice = Array(parts[i..<min(parts.count, i + batch)])
+                      let datas = try await withThrowingTaskGroup(of: (Int, Data).self) { group -> [Data] in
+                          for (n, u) in slice.enumerated() {
+                              group.addTask { (n, try await Self.fetchData(u, headers: headers)) }
+                          }
+                          var out = [Data?](repeating: nil, count: slice.count)
+                          for try await (n, d) in group { out[n] = d }
+                          return out.compactMap { $0 }
+                      }
+                      for d in datas { try handle.write(contentsOf: d) }
+                      done += slice.count
+                      i += batch
+                      stage = .downloading(Double(done) / Double(parts.count))
+                  }
+              }
+
+              private func downloadWithAVFoundation(_ master: URL, headers: [String: String], cookies: [HTTPCookie], maxHeight: Int) async throws -> URL {
+                  var opts: [String: Any] = [:]
+                  if !cookies.isEmpty { opts[AVURLAssetHTTPCookiesKey] = cookies }
+                  if !headers.isEmpty { opts["AVURLAssetHTTPHeaderFieldsKey"] = headers }
+                  let asset = AVURLAsset(url: master, options: opts)
+                  let session = AVAssetDownloadURLSession(configuration: .background(withIdentifier: "com.jakebway.cinescout.save.\(UUID().uuidString)"),
+                                                          assetDownloadDelegate: self, delegateQueue: .main)
+                  guard let task = session.makeAssetDownloadTask(asset: asset, assetTitle: title, assetArtworkData: nil,
+                                                                 options: [AVAssetDownloadTaskMinimumRequiredPresentationSizeKey: NSValue(cgSize: CGSize(width: maxHeight * 16 / 9, height: maxHeight))]) else {
+                      throw Problem(message: "iPhone couldn't start downloading this stream.")
+                  }
+                  hlsTask = task
+                  hlsLocation = nil
+                  return try await withCheckedThrowingContinuation { c in
+                      hlsContinuation = c
+                      task.resume()
+                  }
+              }
+
+              nonisolated private static func fetchText(_ url: URL, headers: [String: String]) async throws -> String {
+                  String(decoding: try await fetchData(url, headers: headers), as: UTF8.self)
+              }
+
+              nonisolated private static func fetchData(_ url: URL, headers: [String: String]) async throws -> Data {
+                  var req = URLRequest(url: url, timeoutInterval: 30)
+                  for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
+                  var lastError: Error?
+                  for attempt in 0..<3 {
+                      do {
+                          let (data, resp) = try await URLSession.shared.data(for: req)
+                          let code = (resp as? HTTPURLResponse)?.statusCode ?? 200
+                          if code == 403 || code == 410 {
+                              throw Problem(message: "FebBox's video link expired. Play the movie again, then tap Save.")
+                          }
+                          guard code < 400 else { throw Problem(message: "FebBox's stream answered with error \(code).") }
+                          return data
+                      } catch let p as Problem where p.message.contains("expired") {
+                          throw p
+                      } catch {
+                          lastError = error
+                          try await Task.sleep(nanoseconds: UInt64(attempt + 1) * 700_000_000)
+                      }
+                  }
+                  throw lastError ?? Problem(message: "Couldn't download part of the video.")
+              }
+
+              nonisolated private static func variants(_ text: String) -> [Variant] {
+                  var out: [Variant] = []
+                  let lines = text.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
+                  for (i, l) in lines.enumerated() where l.hasPrefix("#EXT-X-STREAM-INF") {
+                      guard let uri = lines[(i + 1)...].first(where: { !$0.isEmpty && !$0.hasPrefix("#") }) else { continue }
+                      let res = attribute("RESOLUTION", in: l) ?? ""
+                      let height = Int(res.split(separator: "x").last ?? "") ?? 0
+                      let bw = Int(attribute("BANDWIDTH", in: l) ?? "") ?? 0
+                      out.append(Variant(uri: uri, height: height, bandwidth: bw))
+                  }
+                  return out
+              }
+
+              nonisolated private static func attribute(_ name: String, in line: String) -> String? {
+                  guard let r = line.range(of: #"(?:^|[:,])"# + name + #"=("[^"]*"|[^,]*)"#, options: .regularExpression) else { return nil }
+                  let pair = String(line[r]).drop { $0 == ":" || $0 == "," }
+                  guard let eq = pair.firstIndex(of: "=") else { return nil }
+                  return String(pair[pair.index(after: eq)...]).trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+              }
+
+              // MARK: Shrinking to a small 1080p MP4
+
+              private func convert(_ input: URL, in work: URL) async throws -> URL {
+                  stage = .converting(0)
+                  let asset = AVURLAsset(url: input)
+                  guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+                      throw Problem(message: "That download didn't contain a video iPhone can read.")
+                  }
+                  let size = try await track.load(.naturalSize)
+                  let longest = max(abs(size.width), abs(size.height))
+                  let formats = try await track.load(.formatDescriptions)
+                  let isHEVC = formats.contains { CMFormatDescriptionGetMediaSubType($0) == kCMVideoCodecType_HEVC }
+
+                  // Smallest good-looking option first, then fall back to more compatible ones.
+                  var presets: [String] = []
+                  if let custom = Rules.load().resolved.savePresets, !custom.isEmpty {
+                      presets = custom
+                  } else {
+                      if longest > 1920 { presets += [AVAssetExportPresetHEVC1920x1080, AVAssetExportPreset1920x1080] }
+                      else if !isHEVC { presets += [AVAssetExportPresetHEVCHighestQuality] }
+                      presets += [AVAssetExportPresetPassthrough, AVAssetExportPreset1920x1080]
+                  }
+
+                  let output = work.appendingPathComponent("CineScout-\(UUID().uuidString.prefix(6)).mp4")
+                  var lastError: Error?
+                  for preset in presets {
+                      try Task.checkCancellation()
+                      guard await AVAssetExportSession.compatibility(ofExportPreset: preset, with: asset, outputFileType: .mp4),
+                            let session = AVAssetExportSession(asset: asset, presetName: preset) else { continue }
+                      try? FileManager.default.removeItem(at: output)
+                      session.outputURL = output
+                      session.outputFileType = .mp4
+                      session.shouldOptimizeForNetworkUse = true
+                      DiagLog.shared.log("save", "Making the MP4 (\(Int(size.width))×\(Int(size.height)) → \(preset)).")
+                      let ticker = Task { [weak self] in
+                          while !Task.isCancelled {
+                              try? await Task.sleep(nanoseconds: 400_000_000)
+                              self?.stage = .converting(Double(session.progress))
+                          }
+                      }
+                      await withTaskCancellationHandler { await session.export() } onCancel: { session.cancelExport() }
+                      ticker.cancel()
+                      if session.status == .completed {
+                          try? FileManager.default.removeItem(at: input)
+                          return output
+                      }
+                      lastError = session.error
+                  }
+                  throw Problem(message: "iPhone couldn't turn this video into an MP4 (\(lastError?.localizedDescription ?? "unsupported format")).")
+              }
+
+              // MARK: Photos
+
+              nonisolated private static func addToPhotos(_ file: URL) async throws {
+                  let status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
+                  guard status == .authorized || status == .limited else {
+                      throw Problem(message: "CineScout isn't allowed to add videos to Photos. Open the Settings app → CineScout → Photos → choose “Add Photos Only”, then try again.")
+                  }
+                  try await PHPhotoLibrary.shared().performChanges {
+                      let req = PHAssetCreationRequest.forAsset()
+                      let opts = PHAssetResourceCreationOptions()
+                      opts.shouldMoveFile = true
+                      req.addResource(with: .video, fileURL: file, options: opts)
+                  }
+              }
+
+              nonisolated private static func checkSpace() throws {
+                  let home = URL(fileURLWithPath: NSHomeDirectory())
+                  if let free = try? home.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage,
+                     Double(free) < (Rules.load().resolved.saveMinFreeGB ?? 3) * 1_000_000_000 {
+                      throw Problem(message: "Your iPhone is almost full (\(ByteCountFormatter.string(fromByteCount: Int64(free), countStyle: .file)) free). Saving a movie needs a few GB while it works. Free up some space, then try again.")
+                  }
+              }
+          }
+
+          extension VideoSaver: AVAssetDownloadDelegate {
+              nonisolated func urlSession(_ session: URLSession, assetDownloadTask: AVAssetDownloadTask, didFinishDownloadingTo location: URL) {
+                  Task { @MainActor in self.hlsLocation = location }
+              }
+
+              nonisolated func urlSession(_ session: URLSession, assetDownloadTask: AVAssetDownloadTask, didLoad timeRange: CMTimeRange,
+                                          totalTimeRangesLoaded loadedTimeRanges: [NSValue], timeRangeExpectedToLoad: CMTimeRange) {
+                  let loaded = loadedTimeRanges.map { $0.timeRangeValue.duration.seconds }.reduce(0, +)
+                  let total = timeRangeExpectedToLoad.duration.seconds
+                  guard total > 0 else { return }
+                  Task { @MainActor in self.stage = .downloading(min(1, loaded / total)) }
+              }
+
+              nonisolated func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+                  Task { @MainActor in
+                      guard let c = self.hlsContinuation else { return }
+                      self.hlsContinuation = nil
+                      self.hlsTask = nil
+                      if let error { c.resume(throwing: error) }
+                      else if let l = self.hlsLocation { c.resume(returning: l) }
+                      else { c.resume(throwing: Problem(message: "The stream download finished without a video.")) }
+                  }
+                  session.finishTasksAndInvalidate()
+              }
+          }
+
+          // MARK: The little "Saving to Photos" bar
+
+          struct SaveBanner: View {
+              @ObservedObject var saver = VideoSaver.shared
+
+              var body: some View {
+                  Group {
+                      switch saver.stage {
+                      case .idle:
+                          EmptyView()
+                      case .downloading(let p):
+                          bar(icon: "arrow.down.circle", text: "Downloading “\(saver.title)”", progress: p, cancel: true)
+                      case .converting(let p):
+                          bar(icon: "wand.and.stars", text: "Making a small 1080p copy", progress: p, cancel: true)
+                      case .saving:
+                          bar(icon: "photo.on.rectangle", text: "Adding to Photos…", progress: nil, cancel: false)
+                      case .done(let msg):
+                          bar(icon: "checkmark.circle.fill", text: msg, progress: nil, cancel: false, tint: .green)
+                      case .failed(let msg):
+                          bar(icon: "exclamationmark.triangle.fill", text: msg, progress: nil, cancel: false, tint: .orange, close: true)
+                      }
+                  }
+                  .animation(.easeInOut(duration: 0.25), value: saver.stage)
+              }
+
+              private func bar(icon: String, text: String, progress: Double?, cancel: Bool, tint: Color = .white, close: Bool = false) -> some View {
+                  HStack(spacing: 12) {
+                      Image(systemName: icon).font(.title3).foregroundStyle(tint)
+                      VStack(alignment: .leading, spacing: 6) {
+                          Text(text).font(.subheadline.weight(.semibold)).lineLimit(3).fixedSize(horizontal: false, vertical: true)
+                          if let progress {
+                              ProgressView(value: max(0.02, min(1, progress))).tint(.white)
+                              Text("\(Int(progress * 100))% · keep CineScout open").font(.caption2).foregroundStyle(.secondary)
+                          }
+                      }
+                      Spacer(minLength: 0)
+                      if cancel {
+                          Button("Cancel") { saver.cancel() }.font(.subheadline.weight(.semibold))
+                      } else if close {
+                          Button { saver.dismiss() } label: { Image(systemName: "xmark").font(.subheadline.weight(.bold)) }
+                              .accessibilityLabel("Dismiss")
+                      }
+                  }
+                  .padding(14)
+                  .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                  .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(.white.opacity(0.08)))
+                  .padding(.horizontal, 12)
+                  .foregroundStyle(.white)
+                  .transition(.move(edge: .bottom).combined(with: .opacity))
+              }
+          }
+
+          // MARK: What a stream looks like (for the report)
+
+          /// Looks at a stream (only its first bytes and its playlists, never the whole video) and writes a
+          /// plain description to stream-format.txt, which goes into the report. That's how Claude can tell
+          /// which format FebBox sends and fix saving from the Console.
+          enum StreamProbe {
+              static var fileURL: URL {
+                  FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("stream-format.txt")
+              }
+
+              static func lastText() -> String? { try? String(contentsOf: fileURL, encoding: .utf8) }
+
+              @discardableResult
+              static func run(_ url: URL, headers: [String: String], note: String) async -> String {
+                  var out = "Checked: \(Date().formatted(date: .abbreviated, time: .standard)) (\(note))\n"
+                  out += "URL: \(url.absoluteString.prefix(400))\n"
+                  out += "Headers sent: \(headers.keys.sorted().joined(separator: ", "))\n"
+                  guard let (data, resp) = await peek(url, headers: headers, bytes: 65_535) else {
+                      out += "Couldn't reach the stream.\n"
+                      save(out)
+                      return out
+                  }
+                  out += describe(resp) + "\n"
+                  let head = String(decoding: data.prefix(16), as: UTF8.self)
+                  if head.hasPrefix("#EXTM3U") {
+                      out += "Format: HLS playlist\n"
+                      var text = String(decoding: data, as: UTF8.self)
+                      var base = url
+                      if text.contains("#EXT-X-STREAM-INF") {
+                          out += "--- master playlist (first 50 lines) ---\n" + firstLines(text, 50) + "\n"
+                          let maxH = Rules.load().resolved.saveMaxHeight ?? 1080
+                          let lines = text.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
+                          var best: (Int, String)?
+                          for (i, l) in lines.enumerated() where l.hasPrefix("#EXT-X-STREAM-INF") {
+                              guard let uri = lines[(i + 1)...].first(where: { !$0.isEmpty && !$0.hasPrefix("#") }) else { continue }
+                              let h = Int(l.range(of: #"RESOLUTION=\d+x(\d+)"#, options: .regularExpression).map { String(l[$0]).components(separatedBy: "x").last ?? "" } ?? "") ?? 0
+                              if let b = best {
+                                  let better = h <= maxH ? (b.0 > maxH || h > b.0) : (b.0 > maxH && h < b.0)
+                                  if better { best = (h, uri) }
+                              } else { best = (h, uri) }
+                          }
+                          if let best, let u = URL(string: best.1, relativeTo: url)?.absoluteURL,
+                             let (d2, r2) = await peek(u, headers: headers, bytes: 262_143) {
+                              out += "Chosen variant: \(best.0)p → \(u.absoluteString.prefix(300))\n" + describe(r2) + "\n"
+                              text = String(decoding: d2, as: UTF8.self)
+                              base = u
+                          }
+                      }
+                      let lines = text.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
+                      let segs = lines.filter { !$0.isEmpty && !$0.hasPrefix("#") }
+                      let total = lines.filter { $0.hasPrefix("#EXTINF:") }
+                          .compactMap { Double($0.dropFirst(8).split(separator: ",").first ?? "") }.reduce(0, +)
+                      out += "--- media playlist (first 30 lines) ---\n" + firstLines(text, 30) + "\n"
+                      out += "Pieces: \(segs.count) · length ≈ \(Int(total / 60)) min"
+                      out += " · EXT-X-MAP: \(lines.contains { $0.hasPrefix("#EXT-X-MAP") } ? "yes (fMP4)" : "no")"
+                      out += " · key: \(lines.first { $0.hasPrefix("#EXT-X-KEY") } ?? "none")\n"
+                      let mapURI = lines.first { $0.hasPrefix("#EXT-X-MAP") }.flatMap { l -> String? in
+                          guard let r = l.range(of: #"URI="[^"]+""#, options: .regularExpression) else { return nil }
+                          return String(l[r]).replacingOccurrences(of: "URI=", with: "").trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+                      }
+                      for (label, uri) in [("Header piece", mapURI), ("First piece", segs.first)] {
+                          guard let uri, let u = URL(string: uri, relativeTo: base)?.absoluteURL,
+                                let (d3, r3) = await peek(u, headers: headers, bytes: 4095) else { continue }
+                          out += "\(label): \(u.absoluteString.prefix(200))\n  \(describe(r3)) · looks like: \(container(d3)) · first bytes: \(hex(d3))\n"
+                      }
+                  } else {
+                      out += "Format: single file · looks like: \(container(data)) · first bytes: \(hex(data))\n"
+                  }
+                  save(out)
+                  DiagLog.shared.log("stream", out.components(separatedBy: "\n").filter { $0.hasPrefix("Format") || $0.hasPrefix("Pieces") || $0.hasPrefix("Chosen") }.joined(separator: " | "))
+                  return out
+              }
+
+              private static func save(_ text: String) {
+                  try? text.write(to: fileURL, atomically: true, encoding: .utf8)
+              }
+
+              private static func peek(_ url: URL, headers: [String: String], bytes: Int) async -> (Data, URLResponse)? {
+                  var req = URLRequest(url: url, timeoutInterval: 20)
+                  for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
+                  req.setValue("bytes=0-\(bytes)", forHTTPHeaderField: "Range")
+                  guard let (stream, resp) = try? await URLSession.shared.bytes(for: req) else { return nil }
+                  defer { stream.task.cancel() }
+                  var data = Data()
+                  do {
+                      for try await b in stream {
+                          data.append(b)
+                          if data.count > bytes { break }
+                      }
+                  } catch {}
+                  return (data, resp)
+              }
+
+              private static func describe(_ r: URLResponse) -> String {
+                  guard let h = r as? HTTPURLResponse else { return "No HTTP response" }
+                  let f = { (k: String) in h.value(forHTTPHeaderField: k) ?? "-" }
+                  return "HTTP \(h.statusCode) · Content-Type: \(f("Content-Type")) · Length: \(f("Content-Length")) · Range: \(f("Content-Range")) · Server: \(f("Server"))"
+              }
+
+              private static func firstLines(_ t: String, _ n: Int) -> String {
+                  t.components(separatedBy: .newlines).prefix(n).map { String($0.prefix(300)) }.joined(separator: "\n")
+              }
+
+              private static func hex(_ d: Data) -> String {
+                  d.prefix(16).map { String(format: "%02x", $0) }.joined(separator: " ")
+              }
+
+              static func container(_ d: Data) -> String {
+                  let b = [UInt8](d.prefix(12))
+                  guard b.count >= 4 else { return "empty" }
+                  if b.count >= 8 {
+                      let box = String(decoding: b[4..<8], as: UTF8.self)
+                      if box == "ftyp" { return "MP4/MOV (brand \(b.count >= 12 ? String(decoding: b[8..<12], as: UTF8.self) : "?"))" }
+                      if ["styp", "moof", "sidx", "moov", "mdat"].contains(box) { return "fMP4 piece (\(box))" }
+                  }
+                  if b[0] == 0x47 { return "MPEG-TS" }
+                  if b[0] == 0x49 && b[1] == 0x44 && b[2] == 0x33 { return "ID3 + audio/TS" }
+                  if b[0] == 0x1A && b[1] == 0x45 && b[2] == 0xDF && b[3] == 0xA3 { return "MKV/WebM" }
+                  if b[0] == 0x52 && b[1] == 0x49 && b[2] == 0x46 && b[3] == 0x46 { return "AVI (RIFF)" }
+                  if b[0] == 0x3C { return "HTML/XML (probably an error page)" }
+                  return "unknown"
               }
           }
           CINESCOUT_EOF
@@ -6019,7 +6955,7 @@ jobs:
 
                   while !queue.isEmpty && pages < maxPages {
                       if Task.isCancelled { cancelled = true; break }
-                      let take = min(10, queue.count, max(1, maxPages - pages))
+                      let take = min(16, queue.count, max(1, maxPages - pages))
                       let batch = Array(queue.prefix(take))
                       queue.removeFirst(take)
                       if let progress {
@@ -7083,12 +8019,24 @@ jobs:
 
               // MARK: Networking
 
+              /// One connection pool for every page: kept-alive connections, up to 8 at once per site,
+              /// and pages the site says haven't changed come from the cache on a rescan.
+              static let session: URLSession = {
+                  let cfg = URLSessionConfiguration.default
+                  cfg.httpMaximumConnectionsPerHost = 8
+                  cfg.timeoutIntervalForRequest = 12
+                  cfg.requestCachePolicy = .useProtocolCachePolicy
+                  cfg.urlCache = .shared
+                  cfg.waitsForConnectivity = false
+                  return URLSession(configuration: cfg)
+              }()
+
               static func fetch(_ url: URL) async -> Fetched {
                   var req = URLRequest(url: url, timeoutInterval: 12)
                   req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
                   req.setValue("text/html,application/xhtml+xml,*/*;q=0.8", forHTTPHeaderField: "Accept")
                   do {
-                      let (bytes, response) = try await URLSession.shared.bytes(for: req)
+                      let (bytes, response) = try await Scraper.session.bytes(for: req)
                       guard let http = response as? HTTPURLResponse else { bytes.task.cancel(); return .other("") }
                       guard (200..<400).contains(http.statusCode) else {
                           bytes.task.cancel()
@@ -7122,7 +8070,7 @@ jobs:
               static func fetchNFO(_ url: URL) async -> NFO? {
                   var req = URLRequest(url: url, timeoutInterval: 15)
                   req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-                  guard let result = try? await URLSession.shared.data(for: req) else { return nil }
+                  guard let result = try? await Scraper.session.data(for: req) else { return nil }
                   let (data, response) = result
                   guard ((response as? HTTPURLResponse)?.statusCode ?? 0) < 400, data.count < 2_000_000 else { return nil }
                   let text = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
@@ -7253,10 +8201,22 @@ jobs:
 
               // MARK: Helpers
 
+              /// Compiled patterns, reused (the same few patterns are used thousands of times per scan).
+              private static var regexCache: [String: NSRegularExpression] = [:]
+              private static let regexLock = NSLock()
+
               static func regex(_ p: String?, name: String) -> NSRegularExpression? {
                   guard let p, !p.isEmpty else { return nil }
+                  regexLock.lock()
+                  if let hit = regexCache[p] { regexLock.unlock(); return hit }
+                  regexLock.unlock()
                   do {
-                      return try NSRegularExpression(pattern: p)
+                      let re = try NSRegularExpression(pattern: p)
+                      regexLock.lock()
+                      if regexCache.count > 300 { regexCache.removeAll() }
+                      regexCache[p] = re
+                      regexLock.unlock()
+                      return re
                   } catch {
                       DiagLog.shared.log("rules", "\(name) isn't a valid pattern and is being ignored: \(error.localizedDescription)")
                       return nil
@@ -7896,6 +8856,210 @@ jobs:
                   for n in ["name=\"q\"", "name=\"s\"", "name=\"keyword\"", "name=\"query\"", "name=\"search\"", "name=\"k\""] where blob.contains(n) { s += 2 }
                   return s
               }
+          }
+          CINESCOUT_EOF
+
+          # ---- Speed.swift
+          cat > 'CineScout/Sources/Speed.swift' <<'CINESCOUT_EOF'
+          import SwiftUI
+          import UIKit
+          import ImageIO
+          import WebKit
+          import AVFoundation
+
+          // MARK: Posters: cached, shrunk to screen size, fetched ahead of time
+
+          /// Downloads each poster once, shrinks it to the size it's shown at (less memory, smoother scrolling),
+          /// and keeps it in memory and on disk. Posters just ahead of where you're scrolling are fetched early.
+          actor ImagePipeline {
+              static let shared = ImagePipeline()
+
+              private let memory: NSCache<NSURL, UIImage> = {
+                  let c = NSCache<NSURL, UIImage>()
+                  c.totalCostLimit = 120 * 1024 * 1024
+                  return c
+              }()
+              private var inFlight: [URL: Task<UIImage?, Never>] = [:]
+              private let session: URLSession = {
+                  let cfg = URLSessionConfiguration.default
+                  cfg.urlCache = URLCache(memoryCapacity: 16 * 1024 * 1024, diskCapacity: 600 * 1024 * 1024,
+                                          directory: FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("posters"))
+                  cfg.requestCachePolicy = .returnCacheDataElseLoad
+                  cfg.httpMaximumConnectionsPerHost = 6
+                  cfg.timeoutIntervalForRequest = 20
+                  return URLSession(configuration: cfg)
+              }()
+
+              nonisolated func cached(_ url: URL) -> UIImage? { memory.object(forKey: url as NSURL) }
+
+              func image(_ url: URL, maxPixel: CGFloat = 720) async -> UIImage? {
+                  if let hit = memory.object(forKey: url as NSURL) { return hit }
+                  if let running = inFlight[url] { return await running.value }
+                  let task = Task<UIImage?, Never>.detached(priority: .utility) { [session] in
+                      var req = URLRequest(url: url)
+                      req.setValue(Scraper.userAgent, forHTTPHeaderField: "User-Agent")
+                      guard let (data, _) = try? await session.data(for: req) else { return nil }
+                      return Self.downsample(data, maxPixel: maxPixel)
+                  }
+                  inFlight[url] = task
+                  let img = await task.value
+                  inFlight[url] = nil
+                  if let img {
+                      let cost = Int(img.size.width * img.size.height * img.scale * img.scale * 4)
+                      memory.setObject(img, forKey: url as NSURL, cost: cost)
+                  }
+                  return img
+              }
+
+              /// Fetch ahead without waiting.
+              nonisolated func prefetch(_ urls: [URL]) {
+                  for u in urls.prefix(24) where cached(u) == nil {
+                      Task(priority: .background) { _ = await self.image(u) }
+                  }
+              }
+
+              private static func downsample(_ data: Data, maxPixel: CGFloat) -> UIImage? {
+                  let opts = [kCGImageSourceShouldCache: false] as CFDictionary
+                  guard let src = CGImageSourceCreateWithData(data as CFData, opts) else { return UIImage(data: data) }
+                  let thumb: [CFString: Any] = [
+                      kCGImageSourceCreateThumbnailFromImageAlways: true,
+                      kCGImageSourceCreateThumbnailWithTransform: true,
+                      kCGImageSourceShouldCacheImmediately: true,
+                      kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+                  ]
+                  guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, thumb as CFDictionary) else { return UIImage(data: data) }
+                  return UIImage(cgImage: cg)
+              }
+          }
+
+          /// A poster from the cache, appearing instantly when it's already been loaded.
+          struct CachedArt: View {
+              let url: URL
+              var maxPixel: CGFloat = 720
+              @State private var image: UIImage?
+
+              init(url: URL, maxPixel: CGFloat = 720) {
+                  self.url = url
+                  self.maxPixel = maxPixel
+                  _image = State(initialValue: ImagePipeline.shared.cached(url))
+              }
+
+              var body: some View {
+                  ZStack {
+                      if let image {
+                          Image(uiImage: image).resizable().scaledToFill().transition(.opacity)
+                      }
+                  }
+                  .task(id: url) {
+                      guard image == nil else { return }
+                      let img = await ImagePipeline.shared.image(url, maxPixel: maxPixel)
+                      withAnimation(.easeOut(duration: 0.2)) { image = img }
+                  }
+              }
+          }
+
+          // MARK: The hidden browser starts warm
+
+          enum WebWarmup {
+              private static var spare: WKWebView?
+
+              /// Starts WebKit's helper processes at launch, so the first Play doesn't wait for them.
+              @MainActor static func start() {
+                  guard spare == nil else { return }
+                  let v = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
+                  v.loadHTMLString("<html></html>", baseURL: nil)
+                  spare = v
+                  Task { await RobotBlocker.rules() }
+                  DiagLog.shared.debug("speed", "Web engine warmed up.")
+              }
+
+              @MainActor static func release() { spare = nil }
+          }
+
+          /// Keeps the hidden browser from loading things it never needs (fonts, trackers, ads), so pages
+          /// are ready sooner. Pictures still load, because the robot taps the poster's play button.
+          enum RobotBlocker {
+              private static var compiled: WKContentRuleList?
+              // WebKit blocker rules can't use "a|b", so each tracker gets its own line.
+              private static let json = """
+              [
+                {"trigger":{"url-filter":".*","resource-type":["font"]},"action":{"type":"block"}},
+                {"trigger":{"url-filter":"google-analytics"},"action":{"type":"block"}},
+                {"trigger":{"url-filter":"googletagmanager"},"action":{"type":"block"}},
+                {"trigger":{"url-filter":"doubleclick"},"action":{"type":"block"}},
+                {"trigger":{"url-filter":"googlesyndication"},"action":{"type":"block"}},
+                {"trigger":{"url-filter":"adservice"},"action":{"type":"block"}},
+                {"trigger":{"url-filter":"plausible"},"action":{"type":"block"}},
+                {"trigger":{"url-filter":"facebook\\\\.net"},"action":{"type":"block"}},
+                {"trigger":{"url-filter":"hotjar"},"action":{"type":"block"}},
+                {"trigger":{"url-filter":"clarity\\\\.ms"},"action":{"type":"block"}},
+                {"trigger":{"url-filter":"popads"},"action":{"type":"block"}},
+                {"trigger":{"url-filter":"propellerads"},"action":{"type":"block"}},
+                {"trigger":{"url-filter":"adsterra"},"action":{"type":"block"}},
+                {"trigger":{"url-filter":"onclickads"},"action":{"type":"block"}}
+              ]
+              """
+
+              @MainActor static func rules() async -> WKContentRuleList? {
+                  if let compiled { return compiled }
+                  let list: WKContentRuleList? = await withCheckedContinuation { c in
+                      WKContentRuleListStore.default().compileContentRuleList(forIdentifier: "cinescout-robot-v2", encodedContentRuleList: json) { list, error in
+                          if let error { DiagLog.shared.debug("speed", "Blocker rules didn't compile: \(error.localizedDescription)") }
+                          c.resume(returning: list)
+                      }
+                  }
+                  compiled = list
+                  return list
+              }
+
+              @MainActor static func apply(to controller: WKUserContentController) {
+                  if let compiled { controller.add(compiled); return }
+                  Task { if let l = await rules() { controller.add(l) } }
+              }
+          }
+
+          // MARK: Streams found ahead of time
+
+          /// FebBox preview streams found before you press Play (when you open a movie, or for what you're
+          /// in the middle of). Pressing Play then starts at once. Old ones are dropped, since their links expire.
+          struct WarmStream {
+              let url: URL
+              let cookies: [HTTPCookie]
+              let headers: [String: String]
+              let names: [String]
+              let found: Date
+              /// Already asked AVFoundation to start loading it.
+              let asset: AVURLAsset
+
+              var fresh: Bool { Date().timeIntervalSince(found) < 25 * 60 }
+
+              init(url: URL, cookies: [HTTPCookie], headers: [String: String], names: [String]) {
+                  self.url = url
+                  self.cookies = cookies
+                  self.headers = headers
+                  self.names = names
+                  self.found = Date()
+                  self.asset = WarmStream.makeAsset(url: url, cookies: cookies, headers: headers)
+                  let a = asset
+                  Task.detached(priority: .utility) { _ = try? await a.load(.isPlayable, .duration) }
+              }
+
+              static func makeAsset(url: URL, cookies: [HTTPCookie], headers: [String: String]) -> AVURLAsset {
+                  var options: [String: Any] = [AVURLAssetPreferPreciseDurationAndTimingKey: false]
+                  if !cookies.isEmpty { options[AVURLAssetHTTPCookiesKey] = cookies }
+                  if !headers.isEmpty { options["AVURLAssetHTTPHeaderFieldsKey"] = headers }
+                  return AVURLAsset(url: url, options: options)
+              }
+          }
+
+          /// Assets that were loaded ahead of time, handed to the player when it opens.
+          @MainActor enum PreloadedAssets {
+              private static var byURL: [URL: AVURLAsset] = [:]
+              static func put(_ a: AVURLAsset) {
+                  if byURL.count > 6 { byURL.removeAll() }
+                  byURL[a.url] = a
+              }
+              static func take(_ url: URL) -> AVURLAsset? { byURL.removeValue(forKey: url) }
           }
           CINESCOUT_EOF
 
