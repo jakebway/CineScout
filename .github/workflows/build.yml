@@ -4851,9 +4851,11 @@ jobs:
               var febboxStreamPreview: Bool?
               /// Buttons that start FebBox's preview player.
               var febboxPreviewPattern: String?
+              /// Refuse FebBox redirects away from the share link before a share page has shown (false = never refuse).
+              var febboxBlockRedirects: Bool?
 
               static let defaults = Rules(
-                  version: 11,
+                  version: 12,
                   note: "CineScout scanner rules. Claude can send you a new version of this file: paste it in Diagnostics → Scanner rules, save, then rescan. Optional `script` is JavaScript defining extract(html, url) that returns {title, year, overview, poster, videos: [], playLinks: [], links: [], isMovie}; call log(text) to write to the diagnostic log.",
                   playLabelPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:play|watch|stream|view online|start watching|resume|download|direct link|mirror|server)\b|\b(?:2160p|1080p|720p|480p|4k|full movie)\b|^\s*[▶►⏵]"#,
                   genericLabelPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:play|play now|watch|watch now|watch online|watch movie|watch free|stream|stream now|view|download|download now|direct link|link|here|click here|more|more info|info|details|trailer|open|start|resume|next|previous|prev|back|home|menu|login|log in|sign in|register|search|parent directory|\.\./?|name|last modified|size|description|(?:server|mirror|source|part|episode|ep|season|page)\s*#?\d*|\d{3,4}p|4k|uhd|hd|sd|mp4|mkv|m3u8|open in \S+(?: app)?|»|«|›|‹|\d{1,2})\s*$"#,
@@ -4899,7 +4901,8 @@ jobs:
                   febboxRemovePattern: #"(?i)^\s*(?:remove(?: from (?:list|collaboration))?|exit(?: collaboration)?|leave(?: collaboration)?|quit(?: collaboration)?|cancel collaboration|stop collaborat(?:ing|ion)|delete)\s*$"#,
                   febboxMorePattern: #"(?i)^\s*(?:⋯|…|\.\.\.|more|more actions|menu|options)\s*$"#,
                   febboxStreamPreview: true,
-                  febboxPreviewPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:preview|play|watch|open|stream|play online|online play)\s*$"#
+                  febboxPreviewPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:preview|play|watch|open|stream|play online|online play)\s*$"#,
+                  febboxBlockRedirects: true
               )
 
               /// These rules with built-in defaults filled in for anything missing.
@@ -4941,7 +4944,8 @@ jobs:
                       febboxRemovePattern: febboxRemovePattern ?? d.febboxRemovePattern,
                       febboxMorePattern: febboxMorePattern ?? d.febboxMorePattern,
                       febboxStreamPreview: febboxStreamPreview ?? d.febboxStreamPreview,
-                      febboxPreviewPattern: febboxPreviewPattern ?? d.febboxPreviewPattern
+                      febboxPreviewPattern: febboxPreviewPattern ?? d.febboxPreviewPattern,
+                      febboxBlockRedirects: febboxBlockRedirects ?? d.febboxBlockRedirects
                   )
               }
 
@@ -7147,7 +7151,7 @@ jobs:
               func load(_ url: URL) {
                   freeBrowsingUntil = .distantPast
                   // Starting on the share page itself: it may forward anywhere (Accept → console).
-                  if let lock = lockPattern, Scraper.matches(lock, url.absoluteString) { shareReached = true }
+                  if let lock = lockPattern, Scraper.matches(lock, url.absoluteString) { markShareReached() }
                   webView.load(URLRequest(url: url))
               }
 
@@ -7212,11 +7216,20 @@ jobs:
                       Task { await handOff(url) }
                       return .cancel
                   }
-                  // Until the share page has loaded, refuse FebBox redirects to any other FebBox address.
+                  // Until a share page has shown, refuse FebBox redirects to any other FebBox address.
                   if let url = navigationAction.request.url, let lock = lockPattern, Scraper.matches(lock, url.absoluteString) {
+                      markShareReached()
+                      return .allow
+                  }
+                  // Anything started from a share page (Accept → console) is always allowed.
+                  if let lock = lockPattern,
+                     Scraper.matches(lock, webView.url?.absoluteString ?? "")
+                      || Scraper.matches(lock, navigationAction.sourceFrame.request.url?.absoluteString ?? "") {
+                      markShareReached()
                       return .allow
                   }
                   if let url = navigationAction.request.url,
+                     Rules.load().febboxBlockRedirects ?? true,
                      navigationAction.targetFrame?.isMainFrame ?? true,
                      !shareReached,
                      Date() > freeBrowsingUntil,
@@ -7225,7 +7238,7 @@ jobs:
                      !Scraper.matches(lock, url.absoluteString),
                      navigationAction.navigationType != .linkActivated,
                      navigationAction.navigationType != .formSubmitted {
-                      DiagLog.shared.log("web", "Refused redirect to \(url.absoluteString) (not a share page)")
+                      DiagLog.shared.log("web", "Refused redirect to \(url.absoluteString) (not a share page; current page \(webView.url?.absoluteString ?? "none"))")
                       notice = "FebBox tried to send you to \(url.path.isEmpty ? url.absoluteString : url.path) before the share page loaded. If you need to sign in, tap ⋯ → Sign In to FebBox."
                       return .cancel
                   }
@@ -7242,11 +7255,19 @@ jobs:
                   return .allow
               }
 
+              func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+                  if let u = webView.url, let lock = lockPattern, Scraper.matches(lock, u.absoluteString) { markShareReached() }
+              }
+
               func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-                  if let u = webView.url, let lock = lockPattern, Scraper.matches(lock, u.absoluteString), !shareReached {
-                      shareReached = true
-                      DiagLog.shared.log("web", "Share page loaded; it may now forward to your console.")
-                  }
+                  if let u = webView.url, let lock = lockPattern, Scraper.matches(lock, u.absoluteString) { markShareReached() }
+              }
+
+              private func markShareReached() {
+                  guard !shareReached else { return }
+                  shareReached = true
+                  notice = nil
+                  DiagLog.shared.log("web", "Share page reached; it may now forward to your console.")
               }
 
               func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
