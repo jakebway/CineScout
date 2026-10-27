@@ -4074,6 +4074,8 @@ jobs:
               private var clicked: [String] = []
               private var siteBase: String?
               private var accepted = false
+              /// FebBox asks twice: Accept on the share page, then Accept again in the console's "Working Together" box.
+              private var consoleAcceptClicked: [String] = []
               private var probes = 0
               private var removeClicked = false
               private var goneCount = 0
@@ -4371,12 +4373,13 @@ jobs:
 
               private func probeConsole() async {
                   let out = await evaluate("""
-                  (function (acceptSrc, doAccept, accepted, confirmSrc, collabSrc, previewSrc, names, files, clicked) {
+                  (function (acceptSrc, doAccept, accepted, confirmSrc, collabSrc, previewSrc, names, files, clicked, consoleAcc) {
                     const vids = CS.videoSources();
                     if (vids.length) return JSON.stringify({ videos: vids });
-                    if (doAccept && !accepted) {
-                      const a = CS.clickText(new RegExp(acceptSrc, 'i'), clicked, 45);
-                      if (a) return JSON.stringify({ clicked: a, kind: 'accept' });
+                    // The second Accept: the console's "Working Together" box (it may look like the first one).
+                    if (doAccept && consoleAcc.length < 3) {
+                      const a = CS.clickText(new RegExp(acceptSrc, 'i'), consoleAcc, 45);
+                      if (a) return JSON.stringify({ clicked: a, kind: 'consoleAccept' });
                     }
                     const c0 = CS.clickText(new RegExp(confirmSrc, 'i'), clicked, 20);
                     if (c0) return JSON.stringify({ clicked: c0, kind: 'confirm' });
@@ -4398,10 +4401,17 @@ jobs:
                       if (s) return JSON.stringify({ clicked: s, kind: 'section', present: false });
                     }
                     return JSON.stringify({ present: !!item });
-                  })(\(js(rules.febboxAcceptPattern)), \(rules.febboxAutoAccept ?? true), \(accepted), \(js(playConfirm)), \(js(rules.febboxCollabPattern)), \(js(rules.febboxPreviewPattern)), \(namesJSON), \(fileNamesJSON), \(clickedJSON))
+                  })(\(js(rules.febboxAcceptPattern)), \(rules.febboxAutoAccept ?? true), \(accepted), \(js(playConfirm)), \(js(rules.febboxCollabPattern)), \(js(rules.febboxPreviewPattern)), \(namesJSON), \(fileNamesJSON), \(clickedJSON), \(consoleAcceptJSON))
                   """)
                   if let list = out["videos"] as? [String] {
                       for s in list { if let u = URL(string: s) { foundVideo(u) } }
+                      return
+                  }
+                  if out["kind"] as? String == "consoleAccept", let c = out["clicked"] as? String {
+                      consoleAcceptClicked.append(c)
+                      accepted = true
+                      DiagLog.shared.log("robot", "Tapped “\(label(c))” in the console's collaboration box.")
+                      say("Accepting the collaboration…")
                       return
                   }
                   if let c = out["clicked"] as? String {
@@ -4577,6 +4587,10 @@ jobs:
                   String(decoding: (try? JSONEncoder().encode(clicked)) ?? Data("[]".utf8), as: UTF8.self)
               }
 
+              private var consoleAcceptJSON: String {
+                  String(decoding: (try? JSONEncoder().encode(consoleAcceptClicked)) ?? Data("[]".utf8), as: UTF8.self)
+              }
+
               private var fileNamesJSON: String {
                   String(decoding: (try? JSONEncoder().encode(fileNames)) ?? Data("[]".utf8), as: UTF8.self)
               }
@@ -4638,6 +4652,7 @@ jobs:
 
               func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction) async -> WKNavigationActionPolicy {
                   guard let url = navigationAction.request.url else { return .allow }
+                  if let scheme = url.scheme?.lowercased(), !["http", "https", "about", "blob", "data", "javascript"].contains(scheme) { return .cancel }
                   if videoExts.contains(url.pathExtension.lowercased()) {
                       foundVideo(url)
                       return goal == .findShare ? .allow : .cancel
@@ -7212,6 +7227,12 @@ jobs:
               // MARK: WKNavigationDelegate
 
               func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction) async -> WKNavigationActionPolicy {
+                  // App links like "Open in Feb App" (febbox://…) can't open in here; skip them quietly.
+                  if let scheme = navigationAction.request.url?.scheme?.lowercased(),
+                     !["http", "https", "about", "blob", "data", "javascript"].contains(scheme) {
+                      DiagLog.shared.debug("web", "Skipped app link \(navigationAction.request.url?.absoluteString ?? "")")
+                      return .cancel
+                  }
                   if let url = navigationAction.request.url, Self.videoExts.contains(url.pathExtension.lowercased()) {
                       Task { await handOff(url) }
                       return .cancel
@@ -7283,6 +7304,7 @@ jobs:
                   // "Frame load interrupted" is what a cancelled download looks like; that's us taking over.
                   if ns.domain == "WebKitErrorDomain" && ns.code == 102 { return }
                   if ns.code == NSURLErrorCancelled { return }
+                  if ns.code == NSURLErrorUnsupportedURL { return }   // an app link, not a web page
                   DiagLog.shared.log("web", "Page failed to load: \(ns.domain) \(ns.code) \(ns.localizedDescription)")
                   notice = LibraryStore.friendly(error)
               }
