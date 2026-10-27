@@ -4419,12 +4419,14 @@ jobs:
                     for (let i = 0; i < files.length; i++) {
                       const f = CS.findName([files[i]]);
                       if (!f) continue;
-                      const th = CS.thumb(f);   // the poster/play button opens the preview
+                      // FebBox's desktop site opens a video with a double-click on its tile (.play_video).
+                      const o = CS.openFile(f, clicked);
+                      if (o) return JSON.stringify({ clicked: o, kind: 'file', present: true });
+                      const th = CS.thumb(f);
                       if (th) { const s = CS.clickElement(th, clicked); if (s) return JSON.stringify({ clicked: s, kind: 'file', present: true }); }
-                      const s = CS.clickElement(f, clicked); if (s) return JSON.stringify({ clicked: s, kind: 'file', present: true });
                     }
-                    // 4. The movie's folder (in Movies, or in Shared).
-                    const item = CS.findName(names);
+                    // 4. The movie's folder (in Movies, or in Shared) — never a video file.
+                    const item = CS.findName(names, true);
                     if (item) {
                       const s = CS.clickElement(item, clicked);
                       if (s) return JSON.stringify({ clicked: s, kind: 'item', present: true });
@@ -4496,6 +4498,12 @@ jobs:
                           DiagLog.shared.log("robot", "Opened “\(opened)”.")
                           say("Opening “\(opened)”…")
                       case "file":
+                          // Save this page for the report if no stream shows up (so Claude can see FebBox's player).
+                          Task { [weak self] in
+                              try? await Task.sleep(nanoseconds: 6_000_000_000)
+                              guard let self, !self.finished else { return }
+                              await self.saveSample()
+                          }
                           lastFileProbe = probes
                           DiagLog.shared.log("robot", "Tapped the file “\(label(c))”.")
                           say("Starting “\(label(c))”…")
@@ -4504,7 +4512,7 @@ jobs:
                       }
                   } else if kind == "scroll" {
                       sinceSave = 0
-                  } else if saveState == 2 {
+                  } else if saveState == 2 && (out["present"] as? Bool) != true {
                       // Saved, but nothing to tap here: start again from the console's Files page (once or twice).
                       sinceSave += 1
                       if sinceSave == 4 && reloads < 2, let console = URL(string: rules.febboxConsoleURL ?? "") {
@@ -4529,7 +4537,7 @@ jobs:
                       const c = CS.clickText(new RegExp(confirmSrc, 'i'), clicked, 25);
                       if (c) return JSON.stringify({ clicked: c, kind: 'confirm', present: !!CS.findName(names) });
                     }
-                    const row = CS.findName(names);
+                    const row = CS.findName(names, true);
                     if (!row) {
                       // The folder lives in Files › Movies (or Shared).
                       if (folder) { const m = CS.clickText(new RegExp('^\\s*' + CS.esc(folder) + '\\s*$', 'i'), clicked, 40); if (m) return JSON.stringify({ clicked: m, kind: 'folder', present: false }); }
@@ -4650,6 +4658,18 @@ jobs:
                   });
                   return out;
                 },
+                fileLike: function (t) { return CS.extRe.test(t) || /(?:^|[ ._-])(?:2160p|1080p|720p|480p|x26[45]|h\\.?26[45]|hevc|bluray|web-?dl|webrip|remux)(?:[ ._-]|$)/i.test(t); },
+                openFile: function (el, clicked) {
+                  var tile = el.closest('.play_video, [data-id], tr, li') || el;
+                  var sig = 'open|' + CS.text(el).slice(0, 80) + '|' + (tile.getAttribute('data-id') || '');
+                  if (clicked.indexOf(sig) >= 0) return null;
+                  try { tile.scrollIntoView({ block: 'center' }); } catch (e) {}
+                  // One target only (the poster/icon), so FebBox sees a single double-click.
+                  var t = tile === el ? el : (tile.querySelector('.file_icon, .file_img') || tile.querySelector('.file_name, .file_name_show') || el);
+                  ['mousedown', 'mouseup', 'click'].forEach(function (n) { t.dispatchEvent(new MouseEvent(n, { bubbles: true, cancelable: true, view: window, detail: 1 })); });
+                  t.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, view: window, detail: 2 }));
+                  return sig;
+                },
                 thumb: function (el) {
                   var a = el;
                   for (var k = 0; k < 5 && a && a.parentElement; k++) {
@@ -4696,17 +4716,19 @@ jobs:
                   return null;
                 },
                 norm: function (s) { return (s || '').toLowerCase().replace(/\\.[a-z0-9]{2,4}$/, '').replace(/[^a-z0-9]+/g, ' ').trim().replace(/^(the|a|an) /, ''); },
-                findName: function (names) {
+                findName: function (names, foldersOnly) {
                   var wanted = names.map(CS.norm).filter(function (n) { return n.length > 2; });
                   var els = CS.all();
                   // An exact name first (Polar.Express.2004.2160p.mkv), then anything that starts with it.
                   for (var x = 0; x < els.length; x++) {
                     var e = els[x]; if (e.children.length > 3 || !CS.visible(e)) continue;
+                    if (foldersOnly && CS.fileLike(CS.text(e))) continue;
                     if (wanted.indexOf(CS.norm(CS.text(e))) >= 0) return e;
                   }
                   for (var i = 0; i < els.length; i++) {
                     var el = els[i]; if (el.children.length > 3 || !CS.visible(el)) continue;
                     var raw = CS.text(el); if (!raw || raw.length > 220) continue;
+                    if (foldersOnly && CS.fileLike(raw)) continue;
                     var t = ' ' + CS.norm(raw) + ' ';
                     for (var j = 0; j < wanted.length; j++) { if (t.indexOf(' ' + wanted[j] + ' ') >= 0 || t.indexOf(' ' + wanted[j]) >= 0) return el; }
                   }
