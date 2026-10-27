@@ -719,6 +719,10 @@ jobs:
                   case "verboseoff":
                       UserDefaults.standard.set(false, forKey: "verboseLog")
                       return ("Detailed scan log is off.", true)
+                  case "removenow":
+                      store.pumpRemovals()
+                      let n = (UserDefaults.standard.array(forKey: "febboxPendingRemovals") as? [[String]])?.count ?? 0
+                      return ("Removing \(n) finished item(s) from your FebBox collaborative files.", true)
                   case "help":
                       return (Self.help, true)
                   default:
@@ -728,7 +732,7 @@ jobs:
 
               static let help = """
               Paste what Claude sends you and tap Run.
-              Commands: rescan, lookUpAll, clearLibrary, resetRules, clearLog, verboseOn, verboseOff
+              Commands: rescan, lookUpAll, clearLibrary, resetRules, clearLog, verboseOn, verboseOff, removeNow
               Script: cinescout.movies(), cinescout.editMovie(id, {title, year, overview, poster}), cinescout.removeMovie(id), cinescout.rules(), cinescout.setRules({...}), cinescout.setSetting(key, value), cinescout.run("rescan"), cinescout.log(text)
               """
 
@@ -1740,12 +1744,68 @@ jobs:
                   m = movie(m.id) ?? m
 
                   if let video = result.videos.first {
-                      prepareJob = PrepareJob(movie: m, url: video, cookies: result.cookies, headers: result.headers)
+                      let rules = Rules.load().resolved
+                      let names = result.names
+                      if rules.febboxStreamPreview ?? true {
+                          // Play FebBox's own preview stream directly: nothing is downloaded.
+                          var req = request(for: m, url: video, cookies: result.cookies, headers: result.headers)
+                          req.febboxNames = names
+                          DiagLog.shared.log("robot", "Streaming FebBox's preview for “\(m.title)”.")
+                          nowPlaying = req
+                      } else {
+                          var job = PrepareJob(movie: m, url: video, cookies: result.cookies, headers: result.headers)
+                          job.febboxNames = names
+                          prepareJob = job
+                      }
                   } else if let share = result.share {
                       DiagLog.shared.log("robot", "No video file found automatically on \(share.absoluteString); showing the share page.")
                       webSession = WebSession(movie: m, link: ExternalLink(service: svc?.name ?? "FebBox", url: share, label: nil))
                   } else {
                       alertMessage = "CineScout opened “\(m.title)” and clicked through, but didn't reach a FebBox share page. Send Claude a report from Settings so it can be fixed with a paste."
+                  }
+              }
+
+              // MARK: Removing finished items from your FebBox collaborative files
+
+              private let pendingRemovalKey = "febboxPendingRemovals"
+              private var removalFailuresThisSession = 0
+
+              private var pendingRemovals: [[String]] {
+                  get { (UserDefaults.standard.array(forKey: pendingRemovalKey) as? [[String]]) ?? [] }
+                  set { UserDefaults.standard.set(newValue, forKey: pendingRemovalKey) }
+              }
+
+              /// Called when you close the player after a FebBox video.
+              func scheduleFebBoxRemoval(_ names: [String], title: String) {
+                  guard Rules.load().resolved.febboxRemoveAfterPlay ?? true, !names.isEmpty else { return }
+                  if !pendingRemovals.contains(names) { pendingRemovals.append(names) }
+                  DiagLog.shared.log("robot", "Will remove “\(title)” from your FebBox collaborative files.")
+                  Task {
+                      try? await Task.sleep(nanoseconds: 1_500_000_000)
+                      self.pumpRemovals()
+                  }
+              }
+
+              /// Works through removals one at a time, in the background. Ones that fail are kept
+              /// and tried again the next time the app comes to the front.
+              func pumpRemovals() {
+                  guard backgroundRobot == nil, robot == nil, nowPlaying == nil, prepareJob == nil,
+                        removalFailuresThisSession < 3, let names = pendingRemovals.first else { return }
+                  let r = BrowserRobot(rules: Rules.load()) { _ in }
+                  backgroundRobot = r
+                  Task {
+                      let ok = await r.remove(names: names)
+                      self.backgroundRobot = nil
+                      if ok {
+                          self.pendingRemovals.removeAll { $0 == names }
+                      } else {
+                          self.removalFailuresThisSession += 1
+                          var list = self.pendingRemovals
+                          if let i = list.firstIndex(of: names) { list.append(list.remove(at: i)) }
+                          self.pendingRemovals = list
+                      }
+                      self.pumpRemovals()
+                      self.pumpRobot()
                   }
               }
 
@@ -1935,6 +1995,8 @@ jobs:
               /// Called whenever the app comes to the front: quietly refreshes the library if it's
               /// more than 6 hours old, so new movies just show up.
               func autoRefreshIfStale() {
+                  removalFailuresThisSession = 0
+                  pumpRemovals()
                   guard !isScanning, !sites.isEmpty else { return }
                   let oldest = sites.map { $0.lastScanned ?? .distantPast }.min() ?? .distantPast
                   guard Date().timeIntervalSince(oldest) > 6 * 3600 else { return }
@@ -2721,6 +2783,8 @@ jobs:
               var headers: [String: String] = [:]
               /// Temporary folder holding a downloaded copy; deleted when the player closes.
               var cleanup: URL? = nil
+              /// FebBox collaborative item to remove once you close the player.
+              var febboxNames: [String] = []
           }
 
           /// "See all" destination for a shelf.
@@ -2745,6 +2809,8 @@ jobs:
               let url: URL
               let cookies: [HTTPCookie]
               let headers: [String: String]
+              /// FebBox collaborative item to remove once you close the player.
+              var febboxNames: [String] = []
           }
 
           /// Where temporary copies live. Everything in here is deleted after playback,
@@ -3079,6 +3145,7 @@ jobs:
                   var r = store.request(for: job.movie, url: file, cookies: file.isFileURL ? [] : job.cookies,
                                         headers: file.isFileURL ? [:] : job.headers)
                   r.cleanup = cleanup
+                  r.febboxNames = job.febboxNames
                   return r
               }
 
@@ -3306,6 +3373,9 @@ jobs:
                   UIApplication.shared.isIdleTimerDisabled = false
                   if let folder = request.cleanup {
                       WorkFolder.delete(folder, reason: "finished watching “\(request.movie.title)”")
+                  }
+                  if !request.febboxNames.isEmpty {
+                      store.scheduleFebBoxRemoval(request.febboxNames, title: request.movie.title)
                   }
               }
 
@@ -3956,9 +4026,14 @@ jobs:
           import UIKit
           import WebKit
 
-          /// A hidden browser that does what you'd do by hand on sites where Watch now / Download
-          /// are JavaScript buttons: open the movie's page, click through, wait for the FebBox
-          /// share page (refusing any other FebBox address), then find the video file there.
+          /// A hidden browser that does by hand-style taps what you'd do yourself:
+          ///  1. open the movie's page, tap Watch now → Download until the FebBox share page loads
+          ///     (refusing any other FebBox address on the way),
+          ///  2. on the share page tap Accept collaboration,
+          ///  3. play FebBox's preview there, or open your console's collaborative files and
+          ///     preview the file from there,
+          ///  4. later, remove that item from your collaborative files.
+          /// Every button's wording comes from the rules, so it can be adjusted from the Console.
           @MainActor
           final class BrowserRobot: NSObject, WKNavigationDelegate, WKUIDelegate {
               struct Result {
@@ -3966,9 +4041,11 @@ jobs:
                   var videos: [URL] = []
                   var cookies: [HTTPCookie] = []
                   var headers: [String: String] = [:]
+                  /// File / item names seen on the share page (used to find it in the console later).
+                  var names: [String] = []
               }
 
-              private enum Goal { case findShare, findVideo }
+              private enum Goal: String { case findShare, onShare, console, remove }
 
               private let webView: WKWebView
               private var holder: UIView?
@@ -3983,17 +4060,24 @@ jobs:
               private var stopAtShare = false
               private var share: URL?
               private var videos: [URL] = []
+              private var names: [String] = []
               private var clicked: [String] = []
               private var siteBase: String?
+              private var accepted = false
+              private var probes = 0
+              private var removeClicked = false
+              private var goneCount = 0
+              private var removed = false
               private var finished = false
               private var waiter: CheckedContinuation<Void, Never>?
               private var loop: Task<Void, Never>?
               private var timeout: Task<Void, Never>?
 
               init(rules: Rules, status: @escaping (String) -> Void) {
-                  self.rules = rules.resolved
+                  let r = rules.resolved
+                  self.rules = r
                   self.status = status
-                  let svc = rules.resolved.externalServices?.first
+                  let svc = r.externalServices?.first
                   self.service = svc
                   self.serviceHost = Scraper.regex(svc?.hostPattern, name: "hostPattern")
                   self.accept = Scraper.regex(svc?.acceptPattern, name: "acceptPattern")
@@ -4001,18 +4085,18 @@ jobs:
                   let config = WKWebViewConfiguration()
                   config.websiteDataStore = .default()          // shares your FebBox sign-in with the visible browser
                   config.allowsInlineMediaPlayback = true
-                  config.mediaTypesRequiringUserActionForPlayback = .all
+                  config.mediaTypesRequiringUserActionForPlayback = []
                   webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 390, height: 844), configuration: config)
                   super.init()
 
                   let content = config.userContentController
-                  // Pop-up windows report their address instead of opening.
                   let popups = """
                   (function () {
                     window.open = function (u) {
                       try { window.webkit.messageHandlers.robot.postMessage('open:' + new URL(u, location.href).href); } catch (e) {}
                       return null;
                     };
+                    window.alert = function () {}; window.confirm = function () { return true; };
                   })();
                   """
                   content.addUserScript(WKUserScript(source: popups, injectionTime: .atDocumentStart, forMainFrameOnly: false))
@@ -4025,37 +4109,77 @@ jobs:
                   webView.customUserAgent = Scraper.userAgent
               }
 
-              // MARK: Run
+              // MARK: Play flow
 
               /// - Parameters:
               ///   - page: the movie's page on your site (used when the share link isn't known yet)
-              ///   - share: a known FebBox share link (skips straight to finding the video)
+              ///   - share: a known FebBox share link (skips the site steps)
               ///   - stopAtShare: background mode — stop once the share link is found
               func run(page: URL?, share knownShare: URL?, stopAtShare: Bool = false) async -> Result {
                   self.stopAtShare = stopAtShare
-                  attachOffscreen()
-                  defer { detach() }
-
                   if let knownShare {
                       share = knownShare
-                      goal = .findVideo
+                      enter(.onShare)
                       say("Opening the FebBox share page…")
                       webView.load(URLRequest(url: knownShare))
                   } else if let page {
                       siteBase = page.host.map(Scraper.baseDomain)
-                      goal = .findShare
+                      enter(.findShare)
                       say("Opening the movie's page…")
                       webView.load(URLRequest(url: page))
                   } else {
                       return Result()
                   }
                   DiagLog.shared.log("robot", "Start: \(knownShare?.absoluteString ?? page?.absoluteString ?? "")")
+                  await drive(seconds: rules.robotTimeout ?? 60)
 
-                  let limit = UInt64(max(15, min(rules.robotTimeout ?? 45, 180)))
+                  var result = Result(share: share, videos: videos, names: names)
+                  if let v = videos.first {
+                      let all = await webView.configuration.websiteDataStore.httpCookieStore.allCookies()
+                      let host = v.host?.lowercased() ?? ""
+                      result.cookies = all.filter { c in
+                          let d = c.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+                          return host == d || host.hasSuffix("." + d) || d.hasSuffix(Scraper.baseDomain(host))
+                      }
+                      if let ref = webView.url?.absoluteString { result.headers["Referer"] = ref }
+                      result.headers["User-Agent"] = Scraper.userAgent
+                  }
+                  DiagLog.shared.log("robot", "Done: share \(share?.absoluteString ?? "none"), accepted: \(accepted), \(videos.count) stream(s), names: \(names.prefix(3).joined(separator: " | "))")
+                  detach()
+                  return result
+              }
+
+              // MARK: Removal flow
+
+              /// Opens your console's collaborative files and removes the item with one of these names.
+              func remove(names itemNames: [String]) async -> Bool {
+                  names = itemNames.filter { !$0.isEmpty }
+                  guard !names.isEmpty, let console = URL(string: rules.febboxConsoleURL ?? "") else { return false }
+                  enter(.remove)
+                  say("Removing it from your collaborative files…")
+                  DiagLog.shared.log("robot", "Remove from collaborative files: \(names.prefix(3).joined(separator: " | "))")
+                  webView.load(URLRequest(url: console))
+                  await drive(seconds: 75)
+                  DiagLog.shared.log("robot", removed ? "Removed from collaborative files." : "Couldn't confirm the removal (will try again later).")
+                  detach()
+                  return removed
+              }
+
+              func cancel() {
+                  DiagLog.shared.log("robot", "Cancelled.")
+                  finish()
+              }
+
+              // MARK: Engine
+
+              private func drive(seconds: Int) async {
+                  attachOffscreen()
+                  let limit = UInt64(max(15, min(seconds, 240)))
                   timeout = Task { [weak self] in
                       try? await Task.sleep(nanoseconds: limit * 1_000_000_000)
                       guard let self, !Task.isCancelled else { return }
-                      DiagLog.shared.log("robot", "Gave up after \(limit)s (share: \(self.share?.absoluteString ?? "not found"), videos: \(self.videos.count)).")
+                      DiagLog.shared.log("robot", "Stopped after \(limit)s at step “\(self.goal.rawValue)” on \(self.webView.url?.absoluteString ?? "-")")
+                      await self.saveSample()
                       self.finish()
                   }
                   loop = Task { [weak self] in
@@ -4068,25 +4192,6 @@ jobs:
                   await withCheckedContinuation { c in
                       if finished { c.resume() } else { waiter = c }
                   }
-
-                  var result = Result(share: share, videos: videos)
-                  if let v = videos.first {
-                      let all = await webView.configuration.websiteDataStore.httpCookieStore.allCookies()
-                      let host = v.host?.lowercased() ?? ""
-                      result.cookies = all.filter { c in
-                          let d = c.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
-                          return host == d || host.hasSuffix("." + d)
-                      }
-                      if let ref = webView.url?.absoluteString { result.headers["Referer"] = ref }
-                      result.headers["User-Agent"] = Scraper.userAgent
-                  }
-                  DiagLog.shared.log("robot", "Done: share \(share?.absoluteString ?? "none"), \(videos.count) video(s).")
-                  return result
-              }
-
-              func cancel() {
-                  DiagLog.shared.log("robot", "Cancelled.")
-                  finish()
               }
 
               private func finish() {
@@ -4099,97 +4204,88 @@ jobs:
                   waiter = nil
               }
 
+              private func enter(_ g: Goal) {
+                  goal = g
+                  probes = 0
+                  clicked.removeAll()
+              }
+
               private func say(_ text: String) {
                   status(text)
                   DiagLog.shared.debug("robot", text)
               }
+
+              private var playConfirm: String { #"^\s*(?:ok|okay|confirm|yes|sure|accept|agree|continue|got it|done)\s*$"# }
 
               // MARK: Found things
 
               private func foundShare(_ url: URL) {
                   guard share == nil else { return }
                   share = url
-                  say("Found the FebBox share page.")
                   DiagLog.shared.log("robot", "Share link: \(url.absoluteString)")
                   if stopAtShare {
                       finish()
                       return
                   }
-                  goal = .findVideo
-                  clicked.removeAll()
+                  enter(.onShare)
                   say("Opening the FebBox share page…")
                   webView.load(URLRequest(url: url))
               }
 
               private func foundVideo(_ url: URL) {
-                  guard !videos.contains(url) else { return }
+                  guard goal == .onShare || goal == .console, !videos.contains(url) else { return }
                   videos.append(url)
-                  DiagLog.shared.log("robot", "Video: \(url.absoluteString)")
-                  if goal == .findVideo {
-                      say("Found the video.")
+                  DiagLog.shared.log("robot", "Stream: \(url.absoluteString)")
+                  say("Found the video.")
+                  Task { await saveSample() }
+                  finish()
+              }
+
+              private func goToConsole() {
+                  guard let console = URL(string: rules.febboxConsoleURL ?? "") else {
+                      DiagLog.shared.log("robot", "No console address in rules; stopping.")
                       finish()
+                      return
                   }
+                  Task { await saveSample() }
+                  enter(.console)
+                  say("Opening your FebBox collaborative files…")
+                  webView.load(URLRequest(url: console))
               }
 
               func message(_ name: String, _ body: String) {
                   if body.hasPrefix("open:") {
                       guard let u = URL(string: String(body.dropFirst(5))) else { return }
-                      if isAcceptedShare(u) { foundShare(u) } else if isSameSite(u) { webView.load(URLRequest(url: u)) }
+                      if goal == .findShare {
+                          if isAcceptedShare(u) { foundShare(u) } else if isSameSite(u) { webView.load(URLRequest(url: u)) }
+                      } else if isServiceSite(u) || videoExts.contains(u.pathExtension.lowercased()) {
+                          webView.load(URLRequest(url: u))
+                      }
                       return
                   }
-                  // Stream requests seen by the sniffer
-                  // (Ignored while still on your site, so a trailer playing there isn't mistaken for the movie.)
-                  guard goal == .findVideo, let u = URL(string: body), videoExts.contains(u.pathExtension.lowercased()) else { return }
+                  // Stream requests made by FebBox's own preview player.
+                  guard let u = URL(string: body), videoExts.contains(u.pathExtension.lowercased()) else { return }
                   foundVideo(u)
               }
 
               // MARK: Each step
 
               private func probe() async {
-                  if goal == .findShare {
-                      if let u = webView.url, isAcceptedShare(u) { foundShare(u); return }
-                      let out = await evaluate(findShareJS())
-                      if let s = out["share"] as? String, let u = URL(string: s), isAcceptedShare(u) {
-                          foundShare(u)
-                      } else if let c = out["clicked"] as? String {
-                          clicked.append(c)
-                          say("Clicking “\(c.components(separatedBy: "|").first ?? c)”…")
-                          if clicked.count > 10 { DiagLog.shared.log("robot", "Clicked 10 times without reaching a share page.") }
-                      }
-                  } else {
-                      let out = await evaluate(findVideoJS())
-                      if let list = out["videos"] as? [String] {
-                          for s in list { if let u = URL(string: s) { foundVideo(u) } }
-                      } else if let c = out["clicked"] as? String {
-                          clicked.append(c)
-                          say("Opening “\(c.components(separatedBy: "|").first ?? c)”…")
-                      }
+                  probes += 1
+                  switch goal {
+                  case .findShare: await probeFindShare()
+                  case .onShare: await probeShare()
+                  case .console: await probeConsole()
+                  case .remove: await probeRemove()
                   }
-                  if let extra = rules.robotScript, !extra.isEmpty {
+                  if let extra = rules.robotScript, !extra.isEmpty, !finished {
                       _ = try? await webView.evaluateJavaScript(extra + "\n;true")
                   }
               }
 
-              private func evaluate(_ js: String) async -> [String: Any] {
-                  guard let text = try? await webView.evaluateJavaScript(js) as? String,
-                        let obj = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any] else { return [:] }
-                  return obj
-              }
-
-              private static func jsRegex(_ pattern: String?) -> String {
-                  var p = pattern ?? ""
-                  if p.hasPrefix("(?i)") { p.removeFirst(4) }
-                  let data = (try? JSONEncoder().encode(p)) ?? Data("\"\"".utf8)
-                  return String(decoding: data, as: UTF8.self)
-              }
-
-              private var clickedJSON: String {
-                  let data = (try? JSONEncoder().encode(clicked)) ?? Data("[]".utf8)
-                  return String(decoding: data, as: UTF8.self)
-              }
-
-              private func findShareJS() -> String {
-                  """
+              private func probeFindShare() async {
+                  if let u = webView.url, isAcceptedShare(u) { foundShare(u); return }
+                  let out = await evaluate("""
                   (function (acceptSrc, searchSrc, clickSrc, clicked) {
                     const acc = new RegExp(acceptSrc, 'i');
                     const found = [];
@@ -4199,60 +4295,267 @@ jobs:
                       add(e.getAttribute('href') || e.getAttribute('src') || e.getAttribute('data-href') || e.getAttribute('data-url') || e.getAttribute('data-link')));
                     try {
                       const html = document.documentElement.outerHTML.split('\\\\/').join('/');
-                      const re = new RegExp(searchSrc, 'gi');
-                      (html.match(re) || []).forEach(add);
+                      (html.match(new RegExp(searchSrc, 'gi')) || []).forEach(add);
                     } catch (e) {}
                     if (found.length) return JSON.stringify({ share: found[0] });
-                    const cre = new RegExp(clickSrc, 'i');
-                    const els = Array.from(document.querySelectorAll('a, button, [role=button], input[type=button], input[type=submit], [onclick]'));
-                    for (const el of els) {
-                      const t = ((el.innerText || el.value || el.getAttribute('aria-label') || el.title || '') + '').replace(/\\s+/g, ' ').trim();
-                      if (!t || t.length > 50 || !cre.test(t)) continue;
-                      const r = el.getBoundingClientRect();
-                      if (r.width === 0 && r.height === 0) continue;
-                      const sig = t + '|' + (el.getAttribute('href') || el.id || el.className || '');
-                      if (clicked.indexOf(sig) >= 0) continue;
-                      el.scrollIntoView({ block: 'center' });
-                      el.click();
-                      return JSON.stringify({ clicked: sig });
-                    }
-                    return '{}';
-                  })(\(Self.jsRegex(service?.acceptPattern)), \(Self.jsRegex(service?.searchPattern)), \(Self.jsRegex(rules.robotClickPattern)), \(clickedJSON))
-                  """
+                    const c = CS.clickText(new RegExp(clickSrc, 'i'), clicked, 50);
+                    return JSON.stringify(c ? { clicked: c } : {});
+                  })(\(js(service?.acceptPattern)), \(js(service?.searchPattern)), \(js(rules.robotClickPattern)), \(clickedJSON))
+                  """)
+                  if let s = out["share"] as? String, let u = URL(string: s), isAcceptedShare(u) {
+                      foundShare(u)
+                  } else if let c = out["clicked"] as? String {
+                      clicked.append(c)
+                      say("Tapping “\(label(c))”…")
+                  }
               }
 
-              private func findVideoJS() -> String {
-                  """
-                  (function (clickSrc, clicked) {
-                    const ext = /\\.(mp4|m4v|mov|mkv|webm|avi|m3u8|ts|m2ts|wmv)(\\?|#|$)/i;
-                    const vids = [];
-                    document.querySelectorAll('a[href], video, video source, source, [data-src], [data-url]').forEach(e => {
-                      const u = e.currentSrc || e.src || e.getAttribute('href') || e.getAttribute('data-src') || e.getAttribute('data-url');
-                      if (!u) return;
-                      try { const a = new URL(u, location.href).href; if (/^https?:/i.test(a) && ext.test(a)) vids.push(a); } catch (x) {}
-                    });
-                    if (vids.length) return JSON.stringify({ videos: vids });
-                    const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 || r.height > 0; };
-                    const fileName = /\\.(mp4|m4v|mov|mkv|webm|avi|ts|m2ts|wmv)\\b/i;
-                    const btn = new RegExp(clickSrc, 'i');
-                    const all = Array.from(document.querySelectorAll('a, button, [role=button], [onclick], li, div, span, p, td'));
-                    const pick = (test) => {
-                      for (const el of all) {
-                        if (el.children.length > 4) continue;
-                        const t = ((el.innerText || el.value || '') + '').replace(/\\s+/g, ' ').trim();
-                        if (!t || t.length > 140 || !test(t) || !visible(el)) continue;
-                        const sig = t.slice(0, 80) + '|' + (el.getAttribute('href') || el.getAttribute('data-id') || el.className || '');
-                        if (clicked.indexOf(sig) >= 0) continue;
-                        el.scrollIntoView({ block: 'center' });
-                        el.click();
-                        return sig;
+              private func probeShare() async {
+                  let doAccept = rules.febboxAutoAccept ?? true
+                  let out = await evaluate("""
+                  (function (acceptSrc, confirmSrc, previewSrc, doAccept, accepted, clicked) {
+                    const names = CS.fileNames(), title = CS.title();
+                    const vids = CS.videoSources();
+                    if (vids.length) return JSON.stringify({ videos: vids, names, title });
+                    const acc = new RegExp(acceptSrc, 'i');
+                    if (doAccept && !accepted) {
+                      const c = CS.clickText(acc, clicked, 45);
+                      if (c) return JSON.stringify({ clicked: c, kind: 'accept', names, title });
+                    }
+                    if (accepted) {
+                      const c = CS.clickText(new RegExp(confirmSrc, 'i'), clicked, 20);
+                      if (c) return JSON.stringify({ clicked: c, kind: 'confirm', names, title });
+                    }
+                    const p = CS.clickText(new RegExp(previewSrc, 'i'), clicked, 30) || CS.clickMatching(t => CS.extRe.test(t), clicked, 160);
+                    if (p) return JSON.stringify({ clicked: p, kind: 'preview', names, title });
+                    return JSON.stringify({ names, title, acceptVisible: CS.anyText(acc) });
+                  })(\(js(rules.febboxAcceptPattern)), \(js(playConfirm)), \(js(rules.febboxPreviewPattern)), \(doAccept), \(accepted), \(clickedJSON))
+                  """)
+                  collectNames(out)
+                  if let list = out["videos"] as? [String] {
+                      for s in list { if let u = URL(string: s) { foundVideo(u) } }
+                      return
+                  }
+                  if let c = out["clicked"] as? String {
+                      clicked.append(c)
+                      switch out["kind"] as? String {
+                      case "accept":
+                          accepted = true
+                          DiagLog.shared.log("robot", "Tapped “\(label(c))” on the share page.")
+                          say("Accepting the collaboration…")
+                      case "preview":
+                          say("Starting FebBox's preview…")
+                      default:
+                          say("Tapping “\(label(c))”…")
                       }
-                      return null;
-                    };
-                    const s = pick(t => fileName.test(t)) || pick(t => btn.test(t));
-                    return s ? JSON.stringify({ clicked: s }) : '{}';
-                  })(\(Self.jsRegex(rules.robotClickPattern)), \(clickedJSON))
-                  """
+                  }
+                  // Give the share page a few tries; if it won't play here, use the console.
+                  if probes >= (accepted ? 9 : 6) { goToConsole() }
+              }
+
+              private func probeConsole() async {
+                  let out = await evaluate("""
+                  (function (confirmSrc, collabSrc, previewSrc, names, clicked) {
+                    const vids = CS.videoSources();
+                    if (vids.length) return JSON.stringify({ videos: vids });
+                    const c0 = CS.clickText(new RegExp(confirmSrc, 'i'), clicked, 20);
+                    if (c0) return JSON.stringify({ clicked: c0, kind: 'confirm' });
+                    const item = CS.findName(names);
+                    if (!item) {
+                      const s = CS.clickText(new RegExp(collabSrc, 'i'), clicked, 40);
+                      return JSON.stringify(s ? { clicked: s, kind: 'section' } : { present: false });
+                    }
+                    const sig = CS.clickElement(item, clicked);
+                    if (sig) return JSON.stringify({ clicked: sig, kind: 'item', present: true });
+                    const p = CS.clickText(new RegExp(previewSrc, 'i'), clicked, 30);
+                    return JSON.stringify(p ? { clicked: p, kind: 'preview', present: true } : { present: true });
+                  })(\(js(playConfirm)), \(js(rules.febboxCollabPattern)), \(js(rules.febboxPreviewPattern)), \(namesJSON), \(clickedJSON))
+                  """)
+                  if let list = out["videos"] as? [String] {
+                      for s in list { if let u = URL(string: s) { foundVideo(u) } }
+                      return
+                  }
+                  if let c = out["clicked"] as? String {
+                      clicked.append(c)
+                      switch out["kind"] as? String {
+                      case "section": say("Opening collaborative files…")
+                      case "item": say("Opening “\(label(c))”…")
+                      case "preview": say("Starting FebBox's preview…")
+                      default: break
+                      }
+                  }
+                  if probes == 8 && (out["present"] as? Bool) != true {
+                      DiagLog.shared.log("robot", "Couldn't find \(names.first ?? "the file") in the console yet (\(webView.url?.absoluteString ?? "-")).")
+                      await saveSample()
+                  }
+              }
+
+              private func probeRemove() async {
+                  let out = await evaluate("""
+                  (function (collabSrc, removeSrc, confirmSrc, moreSrc, names, clicked, removeClicked) {
+                    const removeRe = new RegExp(removeSrc, 'i'), moreRe = new RegExp(moreSrc, 'i');
+                    if (removeClicked) {
+                      const c = CS.clickText(new RegExp(confirmSrc, 'i'), clicked, 25);
+                      if (c) return JSON.stringify({ clicked: c, kind: 'confirm', present: !!CS.findName(names) });
+                    }
+                    const row = CS.findName(names);
+                    if (!row) {
+                      const s = CS.clickText(new RegExp(collabSrc, 'i'), clicked, 40);
+                      return JSON.stringify(s ? { clicked: s, kind: 'section', present: false } : { present: false });
+                    }
+                    // A remove button or "more" menu next to the item
+                    let anc = row;
+                    for (let i = 0; i < 6 && anc; i++) {
+                      const btns = Array.from(anc.querySelectorAll('a, button, [role=button], [role=menuitem], span, i, div, li')).reverse();
+                      for (const b of btns) {
+                        if (!CS.visible(b)) continue;
+                        const t = CS.text(b);
+                        if (t && t.length < 40 && removeRe.test(t)) { const sig = CS.clickElement(b, clicked); if (sig) return JSON.stringify({ clicked: sig, kind: 'remove', present: true }); }
+                      }
+                      for (const b of btns) {
+                        if (!CS.visible(b)) continue;
+                        const t = CS.text(b);
+                        if (t && t.length < 25 && moreRe.test(t)) { const sig = CS.clickElement(b, clicked); if (sig) return JSON.stringify({ clicked: sig, kind: 'more', present: true }); }
+                      }
+                      anc = anc.parentElement;
+                      if (anc && anc.querySelectorAll('*').length > 600) break;
+                    }
+                    // A menu that opened somewhere else on the page
+                    const r = CS.clickText(removeRe, clicked, 40);
+                    if (r) return JSON.stringify({ clicked: r, kind: 'remove', present: true });
+                    // Select the row (checkbox), then a toolbar Remove appears
+                    const holder = row.closest('tr, li, [class*=item], [class*=row], [class*=file]') || row.parentElement;
+                    const box = holder && holder.querySelector('input[type=checkbox], [role=checkbox], [class*=check]');
+                    if (box && clicked.indexOf('select|' + CS.text(row)) < 0) { box.click(); return JSON.stringify({ clicked: 'select|' + CS.text(row), kind: 'select', present: true }); }
+                    if (clicked.indexOf('context|' + CS.text(row)) < 0) {
+                      row.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
+                      return JSON.stringify({ clicked: 'context|' + CS.text(row), kind: 'more', present: true });
+                    }
+                    return JSON.stringify({ present: true });
+                  })(\(js(rules.febboxCollabPattern)), \(js(rules.febboxRemovePattern)), \(js(rules.febboxConfirmPattern)), \(js(rules.febboxMorePattern)), \(namesJSON), \(clickedJSON), \(removeClicked))
+                  """)
+                  if let c = out["clicked"] as? String {
+                      clicked.append(c)
+                      if out["kind"] as? String == "remove" {
+                          removeClicked = true
+                          DiagLog.shared.log("robot", "Tapped “\(label(c))”.")
+                      }
+                  }
+                  let present = out["present"] as? Bool ?? false
+                  if removeClicked && !present {
+                      goneCount += 1
+                      if goneCount >= 2 {
+                          removed = true
+                          finish()
+                      }
+                  } else {
+                      goneCount = 0
+                  }
+                  if probes == 20 { await saveSample() }
+              }
+
+              // MARK: JavaScript helpers
+
+              private func evaluate(_ body: String) async -> [String: Any] {
+                  guard !finished,
+                        let text = try? await webView.evaluateJavaScript(Self.helpers + "\n" + body) as? String,
+                        let obj = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any] else { return [:] }
+                  return obj
+              }
+
+              /// Shared page helpers: visible text, clicking the innermost matching element, file names, streams.
+              private static let helpers = """
+              var CS = {
+                extRe: /\\.(mp4|m4v|mov|mkv|webm|avi|ts|m2ts|wmv)\\b/i,
+                visible: function (el) { var r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; },
+                text: function (el) { return ((el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('title') || '') + '').replace(/\\s+/g, ' ').trim(); },
+                all: function () { return Array.from(document.querySelectorAll('a, button, [role=button], [role=menuitem], [role=tab], [role=option], input[type=button], input[type=submit], [onclick], li, div, span, p, td, label')).reverse(); },
+                sig: function (el, t) { return t.slice(0, 80) + '|' + (el.getAttribute('href') || el.getAttribute('data-id') || el.id || (typeof el.className === 'string' ? el.className : '') || el.tagName); },
+                clickElement: function (el, clicked) {
+                  var t = CS.text(el) || el.tagName; var s = CS.sig(el, t);
+                  if (clicked.indexOf(s) >= 0) return null;
+                  try { el.scrollIntoView({ block: 'center' }); } catch (e) {}
+                  el.click(); return s;
+                },
+                clickMatching: function (test, clicked, maxLen) {
+                  var els = CS.all();
+                  for (var i = 0; i < els.length; i++) {
+                    var el = els[i]; if (el.children.length > 5) continue;
+                    var t = CS.text(el); if (!t || t.length > maxLen || !test(t) || !CS.visible(el)) continue;
+                    var s = CS.sig(el, t); if (clicked.indexOf(s) >= 0) continue;
+                    try { el.scrollIntoView({ block: 'center' }); } catch (e) {}
+                    el.click(); return s;
+                  }
+                  return null;
+                },
+                clickText: function (re, clicked, maxLen) { return CS.clickMatching(function (t) { return re.test(t); }, clicked, maxLen); },
+                anyText: function (re) { return CS.all().some(function (el) { var t = CS.text(el); return t && t.length < 60 && re.test(t) && CS.visible(el); }); },
+                fileNames: function () {
+                  var out = [];
+                  CS.all().forEach(function (el) {
+                    if (el.children.length > 1) return;
+                    var t = CS.text(el); if (t && t.length < 200 && CS.extRe.test(t) && out.indexOf(t) < 0) out.push(t);
+                  });
+                  return out.slice(0, 12);
+                },
+                title: function () {
+                  var h = document.querySelector('h1, h2, [class*=title], [class*=name]');
+                  return ((h && CS.text(h)) || document.title || '').replace(/\\s*[-|·]\\s*febbox.*$/i, '').trim();
+                },
+                videoSources: function () {
+                  var ext = /\\.(mp4|m4v|mov|mkv|webm|m3u8)(\\?|#|$)/i, out = [];
+                  document.querySelectorAll('video, video source, source').forEach(function (e) {
+                    var u = e.currentSrc || e.src || e.getAttribute('src');
+                    if (u && /^https?:/i.test(u) && (ext.test(u) || e.tagName === 'VIDEO')) out.push(u);
+                  });
+                  return out;
+                },
+                findName: function (names) {
+                  var wanted = names.map(function (n) { return n.toLowerCase(); }).concat(
+                    names.map(function (n) { return n.toLowerCase().replace(/\\.[a-z0-9]{2,4}$/, ''); })).filter(function (n) { return n.length > 2; });
+                  var els = CS.all();
+                  for (var i = 0; i < els.length; i++) {
+                    var el = els[i]; if (el.children.length > 3 || !CS.visible(el)) continue;
+                    var t = CS.text(el).toLowerCase(); if (!t || t.length > 220) continue;
+                    for (var j = 0; j < wanted.length; j++) { if (t.indexOf(wanted[j]) >= 0) return el; }
+                  }
+                  return null;
+                }
+              };
+              """
+
+              private func js(_ pattern: String?) -> String {
+                  var p = pattern ?? ""
+                  if p.hasPrefix("(?i)") { p.removeFirst(4) }
+                  let data = (try? JSONEncoder().encode(p)) ?? Data("\"\"".utf8)
+                  return String(decoding: data, as: UTF8.self)
+              }
+
+              private var clickedJSON: String {
+                  String(decoding: (try? JSONEncoder().encode(clicked)) ?? Data("[]".utf8), as: UTF8.self)
+              }
+
+              private var namesJSON: String {
+                  String(decoding: (try? JSONEncoder().encode(names)) ?? Data("[]".utf8), as: UTF8.self)
+              }
+
+              private func collectNames(_ out: [String: Any]) {
+                  var found = (out["names"] as? [String]) ?? []
+                  if let t = out["title"] as? String, t.count > 2, t.count < 150 { found.append(t) }
+                  for n in found where !names.contains(n) { names.append(n) }
+              }
+
+              private func label(_ sig: String) -> String {
+                  String((sig.components(separatedBy: "|").first ?? sig).prefix(40))
+              }
+
+              /// Saves the current page for the diagnostic report, so Claude can see the real buttons.
+              private func saveSample() async {
+                  guard let html = try? await webView.evaluateJavaScript("document.documentElement.outerHTML") as? String else { return }
+                  let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("samples", isDirectory: true)
+                  try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                  let body = "<!-- \(webView.url?.absoluteString ?? "") -->\n" + String(html.prefix(300_000))
+                  try? body.write(to: dir.appendingPathComponent("febbox-\(goal.rawValue).html"), atomically: true, encoding: .utf8)
               }
 
               // MARK: Where the page may go
@@ -4275,22 +4578,30 @@ jobs:
                   guard let url = navigationAction.request.url else { return .allow }
                   if videoExts.contains(url.pathExtension.lowercased()) {
                       foundVideo(url)
-                      return .cancel
+                      return goal == .findShare ? .allow : .cancel
                   }
-                  let mainFrame = navigationAction.targetFrame?.isMainFrame ?? true
-                  guard mainFrame else { return .allow }
-                  if isServiceSite(url) {
-                      if isAcceptedShare(url) {
-                          if goal == .findShare {
-                              foundShare(url)
-                              return stopAtShare ? .cancel : .allow
+                  guard navigationAction.targetFrame?.isMainFrame ?? true else { return .allow }
+                  if isServiceSite(url) && !isAcceptedShare(url) {
+                      switch goal {
+                      case .findShare:
+                          // On the way to the share page: refuse any other FebBox address.
+                          DiagLog.shared.log("robot", "Refused \(url.absoluteString) (not a share page)")
+                          return .cancel
+                      case .onShare:
+                          // Before accepting, stay on the share page; after accepting, FebBox may take us to the console.
+                          if accepted || navigationAction.navigationType == .linkActivated {
+                              if accepted { enter(.console); say("Opening your FebBox collaborative files…") }
+                              return .allow
                           }
+                          DiagLog.shared.log("robot", "Refused \(url.absoluteString) (not a share page)")
+                          return .cancel
+                      case .console, .remove:
                           return .allow
                       }
-                      // Any other FebBox address: refused, unless it's a file we clicked on the share page.
-                      if goal == .findVideo && navigationAction.navigationType == .linkActivated { return .allow }
-                      DiagLog.shared.log("robot", "Refused \(url.absoluteString) (not a share page)")
-                      return .cancel
+                  }
+                  if goal == .findShare && isAcceptedShare(url) {
+                      foundShare(url)
+                      return stopAtShare ? .cancel : .allow
                   }
                   return .allow
               }
@@ -4300,8 +4611,8 @@ jobs:
                   let mime = (r.mimeType ?? "").lowercased()
                   let disposition = ((r as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Disposition") ?? "").lowercased()
                   let named = disposition.range(of: #"filename\*?=[^;]*\.(mp4|m4v|mov|mkv|webm|avi|wmv|ts|m2ts)"#, options: .regularExpression) != nil
-                  if let url = r.url, mime.hasPrefix("video/") || mime.contains("mpegurl") || named
-                      || (mime.contains("octet-stream") && r.expectedContentLength > 50_000_000) {
+                  if goal != .findShare, goal != .remove, let url = r.url,
+                     mime.hasPrefix("video/") || mime.contains("mpegurl") || named || (mime.contains("octet-stream") && r.expectedContentLength > 50_000_000) {
                       foundVideo(url)
                       return .cancel
                   }
@@ -4310,20 +4621,27 @@ jobs:
 
               func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                            for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-                  // New windows (often ads) are ignored unless they lead to the share page or stay on your site.
+                  // New windows (often ads) are ignored unless they lead somewhere we need.
                   if let url = navigationAction.request.url {
-                      if isAcceptedShare(url) { foundShare(url) } else if isSameSite(url) { webView.load(URLRequest(url: url)) }
+                      if goal == .findShare {
+                          if isAcceptedShare(url) { foundShare(url) } else if isSameSite(url) { webView.load(URLRequest(url: url)) }
+                      } else if isServiceSite(url) {
+                          webView.load(URLRequest(url: url))
+                      } else if videoExts.contains(url.pathExtension.lowercased()) {
+                          foundVideo(url)
+                      }
                   }
                   return nil
               }
 
-              // MARK: Hidden placement (pages need to be "on screen" for their scripts to run normally)
+              // MARK: Hidden placement (pages need to be on screen for their scripts to run normally)
 
               private func attachOffscreen() {
-                  guard let window = UIApplication.shared.connectedScenes
-                      .compactMap({ $0 as? UIWindowScene })
-                      .flatMap(\.windows)
-                      .first(where: \.isKeyWindow) else { return }
+                  guard holder == nil,
+                        let window = UIApplication.shared.connectedScenes
+                          .compactMap({ $0 as? UIWindowScene })
+                          .flatMap(\.windows)
+                          .first(where: \.isKeyWindow) else { return }
                   let box = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
                   box.alpha = 0.01
                   box.isUserInteractionEnabled = false
@@ -4452,8 +4770,24 @@ jobs:
               /// Optional JavaScript run on every page the hidden browser visits (site-specific fixes).
               var robotScript: String?
 
+              // FebBox account steps (done by tapping FebBox's own website buttons in the hidden browser)
+              /// Tap "Accept collaboration" on share pages.
+              var febboxAutoAccept: Bool?
+              /// Remove the item from your collaborative files after you finish watching.
+              var febboxRemoveAfterPlay: Bool?
+              var febboxAcceptPattern: String?
+              var febboxConfirmPattern: String?
+              var febboxConsoleURL: String?
+              var febboxCollabPattern: String?
+              var febboxRemovePattern: String?
+              var febboxMorePattern: String?
+              /// Play FebBox's own preview stream directly (true) instead of downloading first.
+              var febboxStreamPreview: Bool?
+              /// Buttons that start FebBox's preview player.
+              var febboxPreviewPattern: String?
+
               static let defaults = Rules(
-                  version: 8,
+                  version: 9,
                   note: "CineScout scanner rules. Claude can send you a new version of this file: paste it in Diagnostics → Scanner rules, save, then rescan. Optional `script` is JavaScript defining extract(html, url) that returns {title, year, overview, poster, videos: [], playLinks: [], links: [], isMovie}; call log(text) to write to the diagnostic log.",
                   playLabelPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:play|watch|stream|view online|start watching|resume|download|direct link|mirror|server)\b|\b(?:2160p|1080p|720p|480p|4k|full movie)\b|^\s*[▶►⏵]"#,
                   genericLabelPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:play|play now|watch|watch now|watch online|watch movie|watch free|stream|stream now|view|download|download now|direct link|link|here|click here|more|more info|info|details|trailer|open|start|resume|next|previous|prev|back|home|menu|login|log in|sign in|register|search|parent directory|\.\./?|name|last modified|size|description|(?:server|mirror|source|part|episode|ep|season|page)\s*#?\d*|\d{3,4}p|4k|uhd|hd|sd|mp4|mkv|m3u8|open in \S+(?: app)?|»|«|›|‹|\d{1,2})\s*$"#,
@@ -4487,8 +4821,18 @@ jobs:
                   excludeVideoPattern: #"(?i)(?:^|[\s._\-\[(/])(?:trailers?|teasers?|samples?|featurettes?|behind[\s._-]the[\s._-]scenes|deleted[\s._-]scenes?|extras|bonus[\s._-]?features?|making[\s._-]of|bloopers?)(?:[\s._\-\])/]|$)"#,
                   resolvePlayLinksDuringScan: false,
                   robotClickPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:watch now|watch online|watch movie|watch|play now|play movie|play|download now|download movie|download|direct download|get (?:download )?link|go to download|continue|click here to (?:watch|download|continue))(?:\s.{0,25})?$"#,
-                  robotTimeout: 45,
-                  robotScript: ""
+                  robotTimeout: 60,
+                  robotScript: "",
+                  febboxAutoAccept: true,
+                  febboxRemoveAfterPlay: true,
+                  febboxAcceptPattern: #"(?i)^\s*accept(?:\s+(?:the\s+)?collaborat(?:ion|e))?(?:\s+invitation)?\s*$"#,
+                  febboxConfirmPattern: #"(?i)^\s*(?:ok|okay|confirm|yes|sure|accept|agree|continue|remove|delete|exit|leave|done)\s*$"#,
+                  febboxConsoleURL: "https://www.febbox.com/console",
+                  febboxCollabPattern: #"(?i)^\s*(?:collaborat(?:ion|ions|ive|ive files|ed)|shared with me|shared|co-?operation)\s*$"#,
+                  febboxRemovePattern: #"(?i)^\s*(?:remove(?: from (?:list|collaboration))?|exit(?: collaboration)?|leave(?: collaboration)?|quit(?: collaboration)?|cancel collaboration|stop collaborat(?:ing|ion)|delete)\s*$"#,
+                  febboxMorePattern: #"(?i)^\s*(?:⋯|…|\.\.\.|more|more actions|menu|options)\s*$"#,
+                  febboxStreamPreview: true,
+                  febboxPreviewPattern: #"(?i)^\s*(?:[▶►⏵]\s*)?(?:preview|play|watch|open|stream|play online|online play)\s*$"#
               )
 
               /// These rules with built-in defaults filled in for anything missing.
@@ -4519,7 +4863,17 @@ jobs:
                       resolvePlayLinksDuringScan: resolvePlayLinksDuringScan ?? d.resolvePlayLinksDuringScan,
                       robotClickPattern: robotClickPattern ?? d.robotClickPattern,
                       robotTimeout: robotTimeout ?? d.robotTimeout,
-                      robotScript: robotScript ?? d.robotScript
+                      robotScript: robotScript ?? d.robotScript,
+                      febboxAutoAccept: febboxAutoAccept ?? d.febboxAutoAccept,
+                      febboxRemoveAfterPlay: febboxRemoveAfterPlay ?? d.febboxRemoveAfterPlay,
+                      febboxAcceptPattern: febboxAcceptPattern ?? d.febboxAcceptPattern,
+                      febboxConfirmPattern: febboxConfirmPattern ?? d.febboxConfirmPattern,
+                      febboxConsoleURL: febboxConsoleURL ?? d.febboxConsoleURL,
+                      febboxCollabPattern: febboxCollabPattern ?? d.febboxCollabPattern,
+                      febboxRemovePattern: febboxRemovePattern ?? d.febboxRemovePattern,
+                      febboxMorePattern: febboxMorePattern ?? d.febboxMorePattern,
+                      febboxStreamPreview: febboxStreamPreview ?? d.febboxStreamPreview,
+                      febboxPreviewPattern: febboxPreviewPattern ?? d.febboxPreviewPattern
                   )
               }
 
@@ -4619,6 +4973,9 @@ jobs:
                       ("playClassPattern", r.playClassPattern), ("skipHrefPattern", r.skipHrefPattern),
                       ("chainLabelPattern", r.chainLabelPattern), ("excludeVideoPattern", r.excludeVideoPattern),
                       ("robotClickPattern", r.robotClickPattern),
+                      ("febboxAcceptPattern", r.febboxAcceptPattern), ("febboxConfirmPattern", r.febboxConfirmPattern),
+                      ("febboxCollabPattern", r.febboxCollabPattern), ("febboxRemovePattern", r.febboxRemovePattern),
+                      ("febboxMorePattern", r.febboxMorePattern), ("febboxPreviewPattern", r.febboxPreviewPattern),
                   ]
                   var allPatterns = patterns
                   for svc in r.externalServices ?? [] {
