@@ -4067,7 +4067,10 @@ jobs:
               private var stopAtShare = false
               private var share: URL?
               private var videos: [URL] = []
+              /// The movie's title and the folder opened in Shared (what gets removed afterwards).
               private var names: [String] = []
+              /// Video file names seen on the share page, best first (4K, then 1080p…).
+              private var fileNames: [String] = []
               private var clicked: [String] = []
               private var siteBase: String?
               private var accepted = false
@@ -4145,7 +4148,7 @@ jobs:
                   DiagLog.shared.log("robot", "Start: \(knownShare?.absoluteString ?? page?.absoluteString ?? "")")
                   await drive(seconds: rules.robotTimeout ?? 60)
 
-                  var result = Result(share: share, videos: videos, names: names, needsSignIn: needsSignIn)
+                  var result = Result(share: share, videos: videos, names: names + fileNames, needsSignIn: needsSignIn)
                   if let v = videos.first {
                       let all = await webView.configuration.websiteDataStore.httpCookieStore.allCookies()
                       let host = v.host?.lowercased() ?? ""
@@ -4166,6 +4169,7 @@ jobs:
               /// Opens your console's collaborative files and removes the item with one of these names.
               func remove(names itemNames: [String]) async -> Bool {
                   names = itemNames.filter { !$0.isEmpty }
+                  fileNames = []
                   guard !names.isEmpty, let console = URL(string: rules.febboxConsoleURL ?? "") else { return false }
                   enter(.remove)
                   say("Removing it from Shared…")
@@ -4367,7 +4371,7 @@ jobs:
 
               private func probeConsole() async {
                   let out = await evaluate("""
-                  (function (acceptSrc, doAccept, accepted, confirmSrc, collabSrc, previewSrc, names, clicked) {
+                  (function (acceptSrc, doAccept, accepted, confirmSrc, collabSrc, previewSrc, names, files, clicked) {
                     const vids = CS.videoSources();
                     if (vids.length) return JSON.stringify({ videos: vids });
                     if (doAccept && !accepted) {
@@ -4376,16 +4380,25 @@ jobs:
                     }
                     const c0 = CS.clickText(new RegExp(confirmSrc, 'i'), clicked, 20);
                     if (c0) return JSON.stringify({ clicked: c0, kind: 'confirm' });
+                    // Inside the movie's folder: tap the video file (best quality first).
+                    for (let i = 0; i < files.length; i++) {
+                      const f = CS.findName([files[i]]);
+                      if (f) { const s = CS.clickElement(f, clicked); if (s) return JSON.stringify({ clicked: s, kind: 'file', present: true }); }
+                    }
+                    // The movie's folder in Shared.
                     const item = CS.findName(names);
+                    if (item) {
+                      const s = CS.clickElement(item, clicked);
+                      if (s) return JSON.stringify({ clicked: s, kind: 'item', present: true });
+                    }
+                    const p = CS.clickText(new RegExp(previewSrc, 'i'), clicked, 30);
+                    if (p) return JSON.stringify({ clicked: p, kind: 'preview', present: !!item });
                     if (!item) {
                       const s = CS.clickText(new RegExp(collabSrc, 'i'), clicked, 40);
-                      return JSON.stringify(s ? { clicked: s, kind: 'section' } : { present: false });
+                      if (s) return JSON.stringify({ clicked: s, kind: 'section', present: false });
                     }
-                    const sig = CS.clickElement(item, clicked);
-                    if (sig) return JSON.stringify({ clicked: sig, kind: 'item', present: true });
-                    const p = CS.clickText(new RegExp(previewSrc, 'i'), clicked, 30);
-                    return JSON.stringify(p ? { clicked: p, kind: 'preview', present: true } : { present: true });
-                  })(\(js(rules.febboxAcceptPattern)), \(rules.febboxAutoAccept ?? true), \(accepted), \(js(playConfirm)), \(js(rules.febboxCollabPattern)), \(js(rules.febboxPreviewPattern)), \(namesJSON), \(clickedJSON))
+                    return JSON.stringify({ present: !!item });
+                  })(\(js(rules.febboxAcceptPattern)), \(rules.febboxAutoAccept ?? true), \(accepted), \(js(playConfirm)), \(js(rules.febboxCollabPattern)), \(js(rules.febboxPreviewPattern)), \(namesJSON), \(fileNamesJSON), \(clickedJSON))
                   """)
                   if let list = out["videos"] as? [String] {
                       for s in list { if let u = URL(string: s) { foundVideo(u) } }
@@ -4400,10 +4413,14 @@ jobs:
                           say("Accepting the collaboration…")
                       case "section": say("Opening Shared…")
                       case "item":
-                          // Remember exactly what we opened, so the same item is removed afterwards.
+                          // Remember exactly which folder we opened, so the same one is removed afterwards.
                           let opened = label(c)
                           if opened.count > 2 && !names.contains(opened) { names.insert(opened, at: 0) }
+                          DiagLog.shared.log("robot", "Opened “\(opened)” in Shared.")
                           say("Opening “\(opened)”…")
+                      case "file":
+                          DiagLog.shared.log("robot", "Tapped the file “\(label(c))”.")
+                          say("Starting “\(label(c))”…")
                       case "preview": say("Starting FebBox's preview…")
                       default: break
                       }
@@ -4534,7 +4551,7 @@ jobs:
                   });
                   return out;
                 },
-                norm: function (s) { return (s || '').toLowerCase().replace(/\\.[a-z0-9]{2,4}$/, '').replace(/[^a-z0-9]+/g, ' ').trim(); },
+                norm: function (s) { return (s || '').toLowerCase().replace(/\\.[a-z0-9]{2,4}$/, '').replace(/[^a-z0-9]+/g, ' ').trim().replace(/^(the|a|an) /, ''); },
                 findName: function (names) {
                   var wanted = names.map(CS.norm).filter(function (n) { return n.length > 2; });
                   var els = CS.all();
@@ -4560,14 +4577,28 @@ jobs:
                   String(decoding: (try? JSONEncoder().encode(clicked)) ?? Data("[]".utf8), as: UTF8.self)
               }
 
+              private var fileNamesJSON: String {
+                  String(decoding: (try? JSONEncoder().encode(fileNames)) ?? Data("[]".utf8), as: UTF8.self)
+              }
+
               private var namesJSON: String {
                   String(decoding: (try? JSONEncoder().encode(names)) ?? Data("[]".utf8), as: UTF8.self)
               }
 
               private func collectNames(_ out: [String: Any]) {
-                  var found = (out["names"] as? [String]) ?? []
-                  if let t = out["title"] as? String, t.count > 2, t.count < 150 { found.append(t) }
-                  for n in found where !names.contains(n) { names.append(n) }
+                  for f in (out["names"] as? [String]) ?? [] where !fileNames.contains(f) { fileNames.append(f) }
+                  func rank(_ s: String) -> Int {
+                      let l = s.lowercased()
+                      if l.contains("2160") || l.contains("4k") || l.contains("uhd") { return 0 }
+                      if l.contains("1080") { return 1 }
+                      return 2
+                  }
+                  fileNames.sort { rank($0) < rank($1) }
+                  if let t = out["title"] as? String, t.count > 2, t.count < 150, !names.contains(t), !Self.looksLikeFile(t) { names.append(t) }
+              }
+
+              private static func looksLikeFile(_ s: String) -> Bool {
+                  s.range(of: #"\.(mp4|m4v|mov|mkv|webm|avi|ts|m2ts|wmv)\b"#, options: [.regularExpression, .caseInsensitive]) != nil
               }
 
               private func label(_ sig: String) -> String {
@@ -7115,6 +7146,8 @@ jobs:
 
               func load(_ url: URL) {
                   freeBrowsingUntil = .distantPast
+                  // Starting on the share page itself: it may forward anywhere (Accept → console).
+                  if let lock = lockPattern, Scraper.matches(lock, url.absoluteString) { shareReached = true }
                   webView.load(URLRequest(url: url))
               }
 
