@@ -1,7 +1,5 @@
 name: Build CineScout
 on: [push, workflow_dispatch]
-permissions:
-  contents: write
 jobs:
   build:
     runs-on: macos-15
@@ -6348,7 +6346,7 @@ jobs:
           [ -f pod.log ] && { echo; echo "===== pod install ====="; cat pod.log; } >> xcodebuild.log
           grep -E "error:|BUILD (SUCCEEDED|FAILED)" xcodebuild.log | head -150 || true
           if [ "$status" -ne 0 ]; then
-            echo "❌ The build failed. Download 'CineScout-files' from this run's Summary page and send xcodebuild.log to Claude."
+            echo "❌ The build failed. Scroll down to Artifacts on this run's page, download 'build-log' and send xcodebuild.log to Claude."
             exit "$status"
           fi
 
@@ -6357,20 +6355,17 @@ jobs:
           mkdir -p Payload
           cp -R build/Build/Products/Release-iphoneos/CineScout.app Payload/
           zip -qry CineScout.ipa Payload
-          echo "✅ Done! CineScout.ipa (build $BUILD) is ready under Releases."
+          echo "✅ Done! CineScout.ipa (build $BUILD) is ready: scroll down to Artifacts on this run's page."
 
-      - name: Save files
-        if: always()
+      - name: Save the app
         uses: actions/upload-artifact@v4
         with:
-          name: CineScout-files
-          path: |
-            CineScout.ipa
-            xcodebuild.log
+          name: CineScout-ipa
+          path: CineScout.ipa
 
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
+      - name: Save the error log
+        if: failure()
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: build-${{ github.run_number }}
-          name: CineScout build ${{ github.run_number }}
-          files: CineScout.ipa
+          name: build-log
+          path: xcodebuild.log
